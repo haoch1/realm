@@ -29,7 +29,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
 fi
 
 DIR=/root/realm
-SCRIPT_VERSION=1.0.3
+SCRIPT_VERSION=1.0.4
 BIN=$DIR/realm
 CONF=$DIR/config.json
 UNIT=/etc/systemd/system/realm.service
@@ -631,7 +631,6 @@ edit_rule() {
         name=$(jq -r --argjson i "$index" --arg fallback "转发规则-$port" '.endpoints[$i].name // $fallback' "$CONF") || return 1
         printf '\n  当前规则: 【%s】 本机 :%s%s%s → %s%s%s  [%s%s%s]\n\n' \
             "$name" "$BLUE" "$port" "$NC" "$BLUE" "$value" "$NC" "$YELLOW" "${protocol^^}" "$NC"
-        printf '  输入 q 取消，按回车保留原值。\n\n'
         read_input value "  新备注名称 (回车保持 $name): " || return 1
         name=${value:-$name}
         read_port port '新本机监听端口' "$port" || return 1
@@ -640,7 +639,7 @@ edit_rule() {
     else
         printf '\n'
         info '=== 添加端口转发规则 ==='
-        printf '\n  输入 q 取消。\n\n'
+        printf '\n'
         read_port port '请输入本机监听端口' || return 1
     fi
     while true; do
