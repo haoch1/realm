@@ -29,7 +29,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
 fi
 
 DIR=/root/realm
-SCRIPT_VERSION=1.0.1
+SCRIPT_VERSION=1.0.2
 BIN=$DIR/realm
 CONF=$DIR/config.json
 UNIT=/etc/systemd/system/realm.service
@@ -360,7 +360,7 @@ update_script() (
     bash -n "$temp" || { fail '新版管理脚本语法检查失败，未替换当前版本。'; exit 1; }
     new_version=$(sed -n 's/^SCRIPT_VERSION=\([0-9][0-9.]*\)$/\1/p' "$temp")
     [[ $new_version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { fail '新版管理脚本缺少有效版本号。'; exit 1; }
-    printf '  当前版本: v%s → 下载版本: v%s\n' "$SCRIPT_VERSION" "$new_version"
+    printf '  当前版本: v%s → 最新版本: v%s\n' "$SCRIPT_VERSION" "$new_version"
     if [[ -f $RT ]]; then
         new_hash=$(sha256sum "$temp") || exit 1
         old_hash=$(sha256sum "$RT") || exit 1
