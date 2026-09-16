@@ -1,5 +1,5 @@
 #!/bin/sh
-# Realm TCP 转发管理。首次添加时安装最新版；rt --update 更新核心。
+# Realm 端口转发管理。首次添加时安装最新版；realm --update 更新核心。
 
 # POSIX 启动段：Alpine 没有 Bash 时先安装，再交给 Bash 运行。
 install_packages() {
@@ -34,13 +34,20 @@ CONF=$DIR/config.json
 UNIT=/etc/systemd/system/realm.service
 INIT=systemd
 RUNLEVEL=/etc/runlevels/default
-RT=/usr/local/bin/rt
+RT=/usr/local/bin/realm
 LOG=/var/log/realm.log
 LOCK=/run/lock/realm-manager.lock
 API=https://api.github.com/repos/zhboner/realm/releases/latest
-BLUE=$'\033[1;34m' GREEN=$'\033[0;32m' RED=$'\033[0;31m' NC=$'\033[0m'
+BLUE=$'\033[1;36m' GREEN=$'\033[0;32m' RED=$'\033[0;31m' YELLOW=$'\033[0;33m' NC=$'\033[0m'
+# Endpoint 的非空设置覆盖全局值；显式 false 也必须保留。
+JQ_PROTOCOL='def protocol($global):
+    ($global + ((.network // {}) | with_entries(select(.value != null)))) as $n
+    | if $n.no_tcp == true then (if $n.use_udp == true then "udp" else "" end)
+      elif $n.use_udp == true then "tcp+udp" else "tcp" end;'
 
-fail() { printf '%s错误：%s%s\n' "$RED" "$*" "$NC" >&2; return 1; }
+fail() { printf '  %s[错误] %s%s\n' "$RED" "$*" "$NC" >&2; return 1; }
+info() { printf '\n  %s=== %s ===%s\n\n' "$BLUE" "$*" "$NC"; }
+success() { printf '  %s[成功] %s%s\n' "$GREEN" "$*" "$NC"; }
 get() { curl -fLsS --retry 2 --connect-timeout 15 --max-time 180 --proto '=https' --proto-redir '=https' "$1" -o "$2"; }
 version() { timeout 10 "$1" -v 2>/dev/null | awk 'NR==1 {sub(/^v/, "", $NF); print $NF}'; }
 
@@ -104,7 +111,7 @@ write_unit() {
     if [[ $INIT == openrc ]]; then
         cat > "$UNIT" <<EOF
 #!/sbin/openrc-run
-description="Realm TCP forwarding"
+description="Realm port forwarding"
 command="$BIN"
 command_args="-c $CONF"
 supervisor="supervise-daemon"
@@ -121,7 +128,7 @@ EOF
     fi
     cat > "$UNIT" <<EOF
 [Unit]
-Description=Realm TCP forwarding
+Description=Realm port forwarding
 After=network-online.target
 Wants=network-online.target
 [Service]
@@ -136,37 +143,7 @@ EOF
 
 init_config() {
     [[ -f $CONF ]] && { jq -e '.endpoints | type == "array"' "$CONF" >/dev/null; return; }
-    local temp
-    temp=$(mktemp "$DIR/.import.XXXXXX") || return 1
-    # 只导入原脚本的三行式 TOML；自定义配置遇到未知字段时停止，避免丢失设置。
-    if [[ -s $DIR/config.toml ]]; then
-        if ! awk '
-          function emit() {
-            if (listen=="" && remote=="") return
-            if (listen=="" || remote=="") {bad=1; return}
-            print listen "\t" remote
-          }
-          /^[[:space:]]*(#.*)?$/ {next}
-          /^[[:space:]]*\[\[endpoints\]\][[:space:]]*(#.*)?$/ {emit(); listen=""; remote=""; endpoint=1; next}
-          /^[[:space:]]*\[network\][[:space:]]*$/ {endpoint=0; next}
-          !endpoint && /^[[:space:]]*(no_tcp|use_udp)[[:space:]]*=[[:space:]]*false[[:space:]]*(#.*)?$/ {next}
-          endpoint && /^[[:space:]]*(listen|remote)[[:space:]]*=[[:space:]]*"[^"\\]*"[[:space:]]*(#.*)?$/ {
-            split($0,a,"\"")
-            if ($0 ~ /^[[:space:]]*listen/) {if(listen!="") bad=1; listen=a[2]}
-            else {if(remote!="") bad=1; remote=a[2]}
-            next
-          }
-          {bad=1}
-          END {emit(); if(bad) exit 1}
-        ' "$DIR/config.toml" > "$temp"; then
-            rm -f "$temp"; fail '旧 TOML 含有自定义或不完整配置，请先手动转换；原文件未修改。'; return 1
-        fi
-    fi
-    jq -Rn '{network:{no_tcp:false,use_udp:false}, endpoints:[inputs | split("\t") | {listen:.[0],remote:.[1]}]}' \
-        < "$temp" > "$temp.json" && mv "$temp.json" "$CONF"
-    local status=$?
-    rm -f "$temp" "$temp.json"
-    return "$status"
+    printf '{"endpoints":[]}\n' > "$CONF"
 }
 
 select_asset() {
@@ -189,19 +166,23 @@ select_asset() {
 }
 
 ready() {
-    local attempt pid sockets address found port
+    local attempt pid sockets expected proto found port
+    expected=$(jq -r "$JQ_PROTOCOL"'
+        .network as $g | .endpoints[] | .listen as $listen
+        | protocol($g) | if length==0 then error("规则未启用 TCP 或 UDP") else split("+")[] end
+        | [., ($listen | split(":") | last)] | @tsv' "$CONF") || return 1
     for attempt in 1 2 3 4 5; do
         sleep 0.4
         svc active || continue
         pid=$(svc pid) || continue
         [[ $pid =~ ^[1-9][0-9]*$ ]] || continue
-        sockets=$(ss -H -ltnp) || continue
+        sockets=$(ss -H -lntup) || continue
         found=1
-        while IFS= read -r address; do
-            port=${address##*:}
-            if ! awk -v port="$port" -v pid="pid=$pid," \
-                '$4 ~ (":" port "$") && index($0,pid) {ok=1} END {exit !ok}' <<< "$sockets"; then found=0; break; fi
-        done < <(jq -r '.endpoints[].listen' "$CONF")
+        while IFS=$'\t' read -r proto port; do
+            [[ -n $proto ]] || continue
+            if ! awk -v proto="$proto" -v port="$port" -v pid="pid=$pid," \
+                '$1==proto && $5 ~ (":" port "$") && index($0,pid) {ok=1} END {exit !ok}' <<< "$sockets"; then found=0; break; fi
+        done <<< "$expected"
         (( found )) && return 0
     done
     fail 'Realm 启动失败或端口未监听。systemd 查看 journalctl -u realm；OpenRC 查看 /var/log/realm.log。'
@@ -308,12 +289,17 @@ apply_rules() (
         if (( enabled )); then svc disable || exit 1; fi
     fi
     changed=0
-    printf '规则已生效。\n'
+    success '规则已生效。'
 )
 
 view_rules() {
-    if [[ $(jq '.endpoints|length' "$CONF") == 0 ]]; then printf '暂无转发规则。\n'; return; fi
-    jq -r '.endpoints | to_entries[] | "[\(.key+1)] \(.value.listen) → \(.value.remote)  [TCP / Realm]"' "$CONF"
+    info '当前端口转发规则'
+    if [[ $(jq '.endpoints|length' "$CONF") == 0 ]]; then printf '  暂无转发规则。\n'; return; fi
+    jq -r --arg green "$GREEN" --arg blue "$BLUE" --arg yellow "$YELLOW" --arg nc "$NC" "$JQ_PROTOCOL"'
+        .network as $g | .endpoints | to_entries[]
+        | .value as $v | ($v | protocol($g) | ascii_upcase) as $proto
+        | ($v.name // ("转发规则-" + ($v.listen | split(":") | last))) as $name
+        | "  \($green)[\(.key+1)]\($nc) 【\($name)】 \($blue)\($v.listen) → \($v.remote)\($nc)  [\($yellow)\($proto)\($nc)]"' "$CONF"
 }
 
 choose_rule() {
@@ -321,48 +307,113 @@ choose_rule() {
     count=$(jq '.endpoints|length' "$CONF") || return 1
     (( count )) || { fail '暂无转发规则。'; return 1; }
     view_rules >&2
-    read -r -p '规则编号（回车取消）：' n || return 1
-    [[ -n $n ]] || return 1
+    read -r -p '  请选择规则序号（0 或回车取消）：' n || return 1
+    [[ -n $n && $n != 0 ]] || return 1
     [[ $n =~ ^[0-9]{1,6}$ ]] && (( 10#$n > 0 && 10#$n <= count )) || { fail '编号无效。'; return 1; }
     printf '%d\n' "$((10#$n-1))"
 }
 
 save_rule() {
-    local index=$1 port=$2 host=$3 target=$4 remote current temp
+    local index=$1 port=$2 host=$3 target=$4 protocol=${5:-tcp} name=${6:-}
+    local remote current old_protocol temp proto flag sockets pid=''
+    case "$protocol" in tcp|udp|tcp+udp) ;; *) fail '请选择 TCP、UDP 或 TCP+UDP。'; return 1 ;; esac
     valid_port "$port" || { fail '监听端口应为 1–65535。'; return 1; }
     port=$((10#$port))
+    name=${name:-转发规则-$port}
+    [[ ${#name} -le 60 && ! $name =~ [[:cntrl:]] ]] || { fail '备注限 60 字，不能包含控制字符。'; return 1; }
     remote=$(remote_address "$host" "$target") || return 1
-    if jq -e --argjson i "$index" --arg p "$port" \
-        '.endpoints | to_entries | any(.key != $i and (.value.listen|split(":")|last)==$p)' "$CONF" >/dev/null; then
-        fail "端口 $port 已有转发规则。"; return 1
+    if jq -e --argjson i "$index" --arg p "$port" --arg proto "$protocol" "$JQ_PROTOCOL"'
+        .network as $g | .endpoints | to_entries | any(
+            .key != $i and (.value.listen | split(":") | last)==$p
+            and ((.value | protocol($g)) as $old | $old==$proto or $old=="tcp+udp" or $proto=="tcp+udp"))' "$CONF" >/dev/null; then
+        fail "${protocol^^} 端口 $port 已有转发规则。"; return 1
     fi
     current=$(jq -r --argjson i "$index" 'if $i<0 then "" else .endpoints[$i].listen end' "$CONF") || return 1
-    if [[ ${current##*:} != "$port" && -n $(ss -H -ltn "sport = :$port") ]]; then
-        fail "TCP 端口 $port 已被占用。"; return 1
-    fi
+    old_protocol=$(jq -r --argjson i "$index" "$JQ_PROTOCOL"'
+        .network as $g | if $i<0 then "" else .endpoints[$i] | protocol($g) end' "$CONF") || return 1
+    if svc active; then pid=$(svc pid) || pid=''; fi
+    for proto in tcp udp; do
+        [[ $protocol == "$proto" || $protocol == tcp+udp ]] || continue
+        flag=-ltnp; [[ $proto != udp ]] || flag=-uanp
+        sockets=$(ss -H "$flag" "sport = :$port") || { fail '无法检查端口占用。'; return 1; }
+        [[ -n $sockets ]] || continue
+        if [[ ${current##*:} == "$port" && ($old_protocol == "$proto" || $old_protocol == tcp+udp) && $pid =~ ^[1-9][0-9]*$ ]] &&
+            awk -v pid="pid=$pid," '!index($0,pid) {bad=1} END {exit bad}' <<< "$sockets"; then continue; fi
+        fail "${proto^^} 端口 $port 已被占用。"; return 1
+    done
     temp=$(mktemp "$DIR/.rules.XXXXXX") || return 1
     # 保留已有规则的监听地址；新规则默认 IPv4 全接口。
     local listen="${current%:*}:$port"
     [[ -n $current ]] || listen="0.0.0.0:$port"
-    jq --argjson i "$index" --arg l "$listen" --arg r "$remote" \
-        'if $i<0 then .endpoints += [{listen:$l,remote:$r}]
-         else .endpoints[$i] += {listen:$l,remote:$r} end' "$CONF" > "$temp" && apply_rules "$temp"
+    jq --argjson i "$index" --arg l "$listen" --arg r "$remote" --arg proto "$protocol" --arg name "$name" '
+        {listen:$l,remote:$r,name:$name} as $rule
+        | {no_tcp:($proto=="udp"),use_udp:($proto!="tcp")} as $net
+        | if $i<0 then .endpoints += [$rule + {network:$net}]
+          else .endpoints[$i] |= (. + $rule | .network = ((.network // {}) + $net)) end' "$CONF" > "$temp" && apply_rules "$temp"
     local status=$?
     rm -f "$temp"
-    if (( status == 0 )); then printf '请确保系统防火墙和云安全组已放行 TCP %s。\n' "$port"; fi
+    if (( status == 0 )); then
+        printf '  【%s】 %s → %s  [%s]\n' "$name" "$listen" "$remote" "${protocol^^}"
+        printf '  请放行 %s 端口 %s；NAT/容器还需映射对应协议的端口。\n' "${protocol^^}" "$port"
+    fi
     return "$status"
 }
 
+read_port() {
+    local label=$1 previous=${2:-} value
+    while true; do
+        read -r -p "  ${label}${previous:+ (回车保持 $previous)}: " value || return 1
+        value=${value:-$previous}
+        if valid_port "$value"; then printf '%d\n' "$((10#$value))"; return; fi
+        fail '无效端口，请输入 1–65535 之间的数字。'
+    done
+}
+
+choose_protocol() {
+    local current=${1:-} choice
+    printf '\n  %s请选择转发协议：%s\n' "$BLUE" "$NC" >&2
+    printf '    %s[1]%s 仅 TCP\n    %s[2]%s 仅 UDP\n    %s[3]%s TCP+UDP\n' "$GREEN" "$NC" "$GREEN" "$NC" "$GREEN" "$NC" >&2
+    if [[ -n $current ]]; then printf '    %s[0]%s 保持 %s\n' "$YELLOW" "$NC" "${current^^}" >&2; fi
+    while true; do
+        if [[ -n $current ]]; then read -r -p '  请选择 [0-3] (回车不改): ' choice || return 1
+        else read -r -p '  请选择 [1-3] (默认 1): ' choice || return 1; fi
+        case "$choice" in
+            '') printf '%s\n' "${current:-tcp}"; return ;;
+            0) if [[ -n $current ]]; then printf '%s\n' "$current"; return; fi ;;
+            1) printf 'tcp\n'; return ;;
+            2) printf 'udp\n'; return ;;
+            3) printf 'tcp+udp\n'; return ;;
+        esac
+        fail '无效选择，请重新输入。'
+    done
+}
+
 edit_rule() {
-    local index=${1:--1} port='' host='' target='' value p h t
+    local index=${1:--1} port='' host='' target='' protocol='' name='' value h
     if (( index >= 0 )); then
+        info '修改端口转发规则'
         value=$(jq -r --argjson i "$index" '.endpoints[$i].listen' "$CONF"); port=${value##*:}
         value=$(jq -r --argjson i "$index" '.endpoints[$i].remote' "$CONF"); target=${value##*:}; host=${value%:*}
+        protocol=$(jq -r --argjson i "$index" "$JQ_PROTOCOL"' .network as $g | .endpoints[$i] | protocol($g)' "$CONF") || return 1
+        name=$(jq -r --argjson i "$index" --arg fallback "转发规则-$port" '.endpoints[$i].name // $fallback' "$CONF") || return 1
+        printf '  当前规则: 【%s】 :%s → %s  [%s]\n\n' "$name" "$port" "$value" "${protocol^^}"
+        read -r -p "  新备注名称 (回车保持 $name): " value || return 1
+        name=${value:-$name}
+    else
+        info '添加端口转发规则 · Realm'
     fi
-    read -r -p "本机监听端口${port:+ [$port]}：" p || return 1
-    read -r -p "目标 IP/域名${host:+ [$host]}：" h || return 1
-    read -r -p "目标端口${target:+ [$target]}：" t || return 1
-    save_rule "$index" "${p:-$port}" "${h:-$host}" "${t:-$target}"
+    port=$(read_port '请输入本机监听端口' "$port") || return 1
+    while true; do
+        read -r -p "  请输入目标地址 (IP 或域名)${host:+ (回车保持 $host)}: " h || return 1
+        h=${h:-$host}
+        if remote_address "$h" 1 >/dev/null; then host=$h; break; fi
+    done
+    target=$(read_port '请输入目标端口' "$target") || return 1
+    protocol=$(choose_protocol "$protocol") || return 1
+    if (( index < 0 )); then
+        read -r -p "  请输入备注名称 (回车默认: 转发规则-$port): " name || return 1
+    fi
+    save_rule "$index" "$port" "$host" "$target" "$protocol" "$name"
 }
 
 delete_rules() {
@@ -391,18 +442,21 @@ uninstall() {
     svc reload || return 1
     rm -rf -- "$DIR" || return 1
     rm -f -- "$LOG" "$LOG".* "$RT" "$LOCK" || return 1
-    printf '卸载完成：服务、核心、规则、备份、独立日志和 rt 命令已清理。\n'
+    printf '卸载完成：服务、核心、规则、备份、独立日志和 realm 命令已清理。\n'
 }
 
 menu() {
-    local count choice index
+    local count choice index current state
     while true; do
         [[ -t 1 ]] && printf '\033[2J\033[H'
         count=$(jq '.endpoints|length' "$CONF") || return 1
+        current=$(version "$BIN") || current='未安装'
         printf '\n%s  ╔══════════════════════════════════════════════╗\n' "$BLUE"
         printf '  ║  端口转发管理 · Realm                       ║\n'
         printf '  ╚══════════════════════════════════════════════╝%s\n' "$NC"
         printf '     当前规则：%s%s%s 条\n\n' "$GREEN" "$count" "$NC"
+        state='未运行'; if svc active; then state='运行中'; fi
+        printf '     Realm：%s  |  状态：%s\n\n' "${current:-未安装}" "$state"
         printf '     [1] 添加转发规则\n     [2] 查看当前转发规则\n     [3] 修改转发规则\n     [4] 删除转发规则\n'
         printf '     %s[5] 清空所有转发规则%s\n     [6] 更新 Realm\n     %s[7] 一键卸载%s\n     [0] 退出脚本\n\n' "$RED" "$NC" "$RED" "$NC"
         read -r -p '请输入选项 [0-7]：' choice || return 0
