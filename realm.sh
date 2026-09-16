@@ -29,6 +29,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
 fi
 
 DIR=/root/realm
+SCRIPT_VERSION=1.0.0
 BIN=$DIR/realm
 CONF=$DIR/config.json
 UNIT=/etc/systemd/system/realm.service
@@ -60,7 +61,7 @@ pause_menu() {
         read -r -p '  按任意键返回主菜单...' _ || true
     fi
 }
-get() { curl -fLsS --retry 2 --connect-timeout 15 --max-time 180 --proto '=https' --proto-redir '=https' "$1" -o "$2"; }
+get() { curl -fLsS --retry 2 --connect-timeout 15 --max-time 180 --proto '=https' --proto-redir '=https' "$1" -o "$2"; } 9>&-
 version() {
     local output
     output=$(timeout 10 "$1" --version 2>&1) || { printf '%s\n' "$output" >&2; return 1; }
@@ -74,42 +75,33 @@ version() {
 
 dependencies() {
     local cmd missing=0
-    for cmd in curl jq tar sha256sum timeout flock ss pgrep stat; do command -v "$cmd" >/dev/null || missing=1; done
+    for cmd in curl jq tar sha256sum timeout flock ss pgrep; do command -v "$cmd" >/dev/null || missing=1; done
     (( missing )) || return 0
     install_packages || return 1
-    for cmd in curl jq tar sha256sum timeout flock ss pgrep stat; do command -v "$cmd" >/dev/null || return 1; done
+    for cmd in curl jq tar sha256sum timeout flock ss pgrep; do command -v "$cmd" >/dev/null || return 1; done
 }
 
 is_manager_pid() {
-    local pid=$1 command
+    local pid=$1 interpreter script
     [[ -r /proc/$pid/cmdline ]] || return 1
-    command=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null) || return 1
-    [[ $command == *'/usr/local/bin/r'* || $command == *'/realm.sh'* || $command == *' realm.sh '* ]]
+    { IFS= read -r -d '' interpreter && IFS= read -r -d '' script; } < "/proc/$pid/cmdline" || return 1
+    [[ ${interpreter##*/} == bash || ${interpreter##*/} == sh ]] || return 1
+    [[ $script == "$RT" || ${script##*/} == realm.sh ]] || return 1
+    [[ /proc/$pid/fd/9 -ef $LOCK ]] || return 1
+    grep -q '^lock:.* FLOCK ' "/proc/$pid/fdinfo/9" 2>/dev/null
 }
 
 lock_holder_pid() {
-    local inode pid fd fd_inode
+    local pid fd
     pid=$(cat "$LOCK" 2>/dev/null) || pid=''
     if [[ $pid =~ ^[1-9][0-9]*$ ]] && (( pid != $$ )) && kill -0 "$pid" 2>/dev/null && is_manager_pid "$pid"; then
         printf '%s\n' "$pid"
         return 0
     fi
 
-    inode=$(stat -Lc '%i' "$LOCK" 2>/dev/null) || inode=''
-    if [[ -n $inode && -r /proc/locks ]]; then
-        pid=$(awk -v inode="$inode" '$2=="FLOCK" && $6 ~ (":" inode "$") {print $5; exit}' /proc/locks)
-        if [[ $pid =~ ^[1-9][0-9]*$ ]] && (( pid != $$ )) && kill -0 "$pid" 2>/dev/null && is_manager_pid "$pid"; then
-            printf '%s\n' "$pid"
-            return 0
-        fi
-    fi
-
-    # 兼容旧脚本留下的空锁文件；BSD flock 可能记录已经退出的 flock 子进程 PID。
-    [[ -n $inode ]] || return 1
-    for fd in /proc/[0-9]*/fd/*; do
-        [[ -e $fd ]] || continue
-        fd_inode=$(stat -Lc '%i' "$fd" 2>/dev/null) || continue
-        [[ $fd_inode == "$inode" ]] || continue
+    # fdinfo 属于持锁的文件描述符，可排除只打开了锁文件的等待进程。
+    for fd in /proc/[0-9]*/fd/9; do
+        [[ $fd -ef $LOCK ]] || continue
         pid=${fd#/proc/}
         pid=${pid%%/*}
         [[ $pid =~ ^[1-9][0-9]*$ ]] && (( pid != $$ )) && is_manager_pid "$pid" || continue
@@ -117,6 +109,19 @@ lock_holder_pid() {
         return 0
     done
     return 1
+}
+
+stop_manager() {
+    local pid=$1 child
+    local -a children=()
+    # 旧版输入辅助进程也可能持锁；仅通知同一脚本的 Bash/sh，不终止服务进程。
+    if [[ -r /proc/$pid/task/$pid/children ]]; then
+        read -r -a children < "/proc/$pid/task/$pid/children" || true
+    fi
+    for child in "${children[@]}"; do
+        if is_manager_pid "$child"; then stop_manager "$child"; fi
+    done
+    kill -TERM "$pid" 2>/dev/null || true
 }
 
 acquire_lock() {
@@ -130,7 +135,7 @@ acquire_lock() {
     holder=$(lock_holder_pid 2>/dev/null) || holder=''
     if [[ $holder =~ ^[1-9][0-9]*$ ]] && kill -0 "$holder" 2>/dev/null && is_manager_pid "$holder"; then
         info '检测到旧的管理界面，正在自动接管...'
-        kill -TERM "$holder" 2>/dev/null || true
+        stop_manager "$holder"
         for (( attempt=0; attempt<50; attempt++ )); do
             if flock -n 9; then
                 printf '%s\n' "$$" > "$LOCK"
@@ -178,7 +183,7 @@ svc() {
             *) rc-service realm "$1" ;;
         esac
     fi
-}
+} 9>&-
 
 check_service() {
     local path command
@@ -229,7 +234,19 @@ EOF
 }
 
 init_config() {
-    [[ -f $CONF ]] && { jq -e '.endpoints | type == "array"' "$CONF" >/dev/null; return; }
+    if [[ -f $CONF ]]; then
+        jq -e '
+            def network_ok:
+                . == null or (type == "object" and
+                    all(.no_tcp, .use_udp; . == null or type == "boolean"));
+            type == "object" and (.network | network_ok) and
+            (.endpoints | type == "array" and all(.[];
+                type == "object" and (.listen | type == "string") and
+                (.remote | type == "string") and (.network | network_ok) and
+                (.name == null or (.name | type == "string"))))
+        ' "$CONF" >/dev/null || { fail '配置文件格式无效，请检查 /root/realm/config.json。'; return 1; }
+        return 0
+    fi
     printf '{"endpoints":[]}\n' > "$CONF"
 }
 
@@ -280,7 +297,8 @@ update_realm() (
     temp=$(mktemp -d "$DIR/.download.XXXXXX") || exit 1
     cleanup() {
         status=$?
-        trap - EXIT INT TERM HUP
+        trap - EXIT
+        trap '' INT TERM HUP
         if (( replaced )); then
             svc stop >/dev/null 2>&1 || true
             if (( had )); then
@@ -298,12 +316,12 @@ update_realm() (
     trap cleanup EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM HUP
-    printf '正在获取 Realm 最新稳定版……\n'
+    printf '  正在获取 Realm 最新稳定版...\n'
     get "$API" "$temp/release.json" && select_asset "$temp/release.json" "$(uname -m)" || {
         fail '获取最新版本失败，请检查 GitHub 访问或 API 限流。'; exit 1;
     }
     current=$(version "$BIN" 2>/dev/null) || current=''
-    [[ $current != "${TAG#v}" ]] || { printf '已是最新版 %s。\n' "$TAG"; exit 0; }
+    [[ $current != "${TAG#v}" ]] || { printf '  已是最新版 %s。\n' "$TAG"; exit 0; }
     get "$URL" "$temp/package.tar.gz" || exit 1
     sum=$(sha256sum "$temp/package.tar.gz") || exit 1
     [[ ${sum%% *} == "${HASH#sha256:}" ]] || { fail 'SHA256 校验失败。'; exit 1; }
@@ -323,11 +341,11 @@ update_realm() (
     mv -f "$temp/realm" "$BIN" || exit 1
     if (( active )); then svc restart && ready || exit 1; fi
     replaced=0
-    printf 'Realm 已更新至 %s。\n' "$TAG"
+    printf '  Realm 已更新至 %s。\n' "$TAG"
 )
 
 update_script() (
-    local target_dir temp first_line new_hash old_hash
+    local target_dir temp first_line new_hash old_hash new_version
     target_dir=${RT%/*}
     [[ $target_dir != "$RT" ]] || target_dir=.
     temp=$(mktemp "$target_dir/.realm-manager.XXXXXX") || exit 1
@@ -340,6 +358,9 @@ update_script() (
     IFS= read -r first_line < "$temp" || true
     [[ $first_line == '#!/bin/sh' ]] || { fail '下载内容不是有效的管理脚本。'; exit 1; }
     bash -n "$temp" || { fail '新版管理脚本语法检查失败，未替换当前版本。'; exit 1; }
+    new_version=$(sed -n 's/^SCRIPT_VERSION=\([0-9][0-9.]*\)$/\1/p' "$temp")
+    [[ $new_version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { fail '新版管理脚本缺少有效版本号。'; exit 1; }
+    printf '  当前版本: v%s → 下载版本: v%s\n' "$SCRIPT_VERSION" "$new_version"
     if [[ -f $RT ]]; then
         new_hash=$(sha256sum "$temp") || exit 1
         old_hash=$(sha256sum "$RT") || exit 1
@@ -351,7 +372,6 @@ update_script() (
     chmod 755 "$temp" && mv -f "$temp" "$RT" || { fail '管理脚本替换失败。'; exit 1; }
     trap - EXIT INT TERM HUP
     success '管理脚本已更新。'
-    exit 10
 )
 
 reload_script() {
@@ -361,17 +381,73 @@ reload_script() {
     fail '无法重新加载管理脚本，请重新运行 r。'
 }
 
+install_script() (
+    local temp
+    mkdir -p "${RT%/*}" || exit 1
+    temp=$(mktemp "${RT%/*}/.realm-manager.XXXXXX") || exit 1
+    trap 'rm -f -- "$temp"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM HUP
+    cp -- "${BASH_SOURCE[0]}" "$temp" && bash -n "$temp" &&
+        chmod 755 "$temp" && mv -f "$temp" "$RT" || exit 1
+)
+
 valid_port() { [[ $1 =~ ^[0-9]{1,5}$ ]] && (( 10#$1 > 0 && 10#$1 < 65536 )); }
+
+valid_ipv4() {
+    local octet
+    local -a octets
+    [[ $1 =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    IFS=. read -r -a octets <<< "$1"
+    for octet in "${octets[@]}"; do
+        [[ $octet == 0 || $octet != 0* ]] && (( 10#$octet <= 255 )) || return 1
+    done
+}
+
+valid_ipv6() {
+    local address=$1 group compressed=0
+    local -a groups=()
+    if [[ $address == *.* ]]; then
+        valid_ipv4 "${address##*:}" || return 1
+        address="${address%:*}:0:0"
+    fi
+    [[ $address =~ ^[a-fA-F0-9:]+$ && $address != *:::* ]] || return 1
+    if [[ $address == *::* ]]; then
+        [[ ${address#*::} != *::* ]] || return 1
+        compressed=1
+        address=${address/::/:}
+        address=${address#:}; address=${address%:}
+    else
+        [[ $address != :* && $address != *: ]] || return 1
+    fi
+    [[ -z $address ]] || IFS=: read -r -a groups <<< "$address"
+    for group in "${groups[@]}"; do [[ $group =~ ^[a-fA-F0-9]{1,4}$ ]] || return 1; done
+    if (( compressed )); then (( ${#groups[@]} < 8 )); else (( ${#groups[@]} == 8 )); fi
+}
+
+valid_host() {
+    local host=${1%.} label
+    local -a labels
+    [[ ${#host} -ge 1 && ${#host} -le 253 && $host != .* && $host != *. && $host != *..* ]] || return 1
+    if [[ $1 == *.* && $1 =~ ^[0-9.]+$ ]]; then valid_ipv4 "$1"; return; fi
+    IFS=. read -r -a labels <<< "$host"
+    for label in "${labels[@]}"; do
+        [[ ${#label} -le 63 && $label =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]] || return 1
+    done
+}
 
 remote_address() {
     local host=$1 port=$2
     valid_port "$port" || { fail '目标端口应为 1–65535。'; return 1; }
-    if [[ $host == \[*\] ]]; then host=${host:1:${#host}-2}; fi
+    if [[ $host == \[*\] ]]; then
+        host=${host:1:${#host}-2}
+        [[ $host == *:* ]] || { fail 'IPv6 地址无效。'; return 1; }
+    fi
     if [[ $host == *:* ]]; then
-        [[ $host =~ ^[a-fA-F0-9:.]+$ ]] || { fail 'IPv6 地址无效。'; return 1; }
+        valid_ipv6 "$host" || { fail 'IPv6 地址无效。'; return 1; }
         printf '[%s]:%d\n' "$host" "$((10#$port))"
     else
-        [[ $host =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]] || { fail '请输入 IP 或域名，不要带协议、路径或空白。'; return 1; }
+        valid_host "$host" || { fail '请输入有效的 IP 或域名，不要带协议、路径或空白。'; return 1; }
         printf '%s:%d\n' "$host" "$((10#$port))"
     fi
 }
@@ -381,7 +457,8 @@ apply_rules() (
     temp=$(mktemp -d "$DIR/.change.XXXXXX") || exit 1
     rollback() {
         status=$?
-        trap - EXIT INT TERM HUP
+        trap - EXIT
+        trap '' INT TERM HUP
         if (( changed )); then
             svc stop >/dev/null 2>&1 || true
             if (( enabled == 0 )); then svc disable >/dev/null 2>&1 || true; fi
@@ -444,7 +521,7 @@ view_rules() {
 }
 
 choose_rule() {
-    local action=${1:-选择} n count
+    local result=$1 action=${2:-选择} n count
     count=$(jq '.endpoints|length' "$CONF") || return 1
     printf '\n' >&2
     info "=== ${action}端口转发规则 ===" >&2
@@ -455,7 +532,7 @@ choose_rule() {
     read -r -p "  请输入要${action}的序号 (0 取消): " n || return 1
     [[ -n $n && $n != 0 ]] || return 1
     [[ $n =~ ^[0-9]{1,6}$ ]] && (( 10#$n > 0 && 10#$n <= count )) || { fail '无效选择'; return 1; }
-    printf '%d\n' "$((10#$n-1))"
+    printf -v "$result" '%d' "$((10#$n-1))"
 }
 
 save_rule() {
@@ -503,7 +580,6 @@ save_rule() {
         else
             success '转发规则已修改并生效！'
         fi
-        printf '  引擎: %sRealm%s\n' "$GREEN" "$NC"
         printf '  转发模式: %s%s%s\n' "$GREEN" "${protocol^^}" "$NC"
         printf '  【%s】 本机端口: %s%s%s → 目标: %s%s%s\n' \
             "$name" "$GREEN" "$port" "$NC" "$GREEN" "$remote" "$NC"
@@ -512,17 +588,17 @@ save_rule() {
 }
 
 read_port() {
-    local label=$1 previous=${2:-} value
+    local result=$1 label=$2 previous=${3:-} input
     while true; do
-        read -r -p "  ${label}${previous:+ (回车保持 $previous)}: " value || return 1
-        value=${value:-$previous}
-        if valid_port "$value"; then printf '%d\n' "$((10#$value))"; return; fi
+        read -r -p "  ${label}${previous:+ (回车保持 $previous)}: " input || return 1
+        input=${input:-$previous}
+        if valid_port "$input"; then printf -v "$result" '%d' "$((10#$input))"; return; fi
         fail '无效端口，请输入 1–65535 之间的数字。'
     done
 }
 
 choose_protocol() {
-    local current=${1:-} choice
+    local result=$1 current=${2:-} choice selected
     printf '\n  %s请选择转发协议：%s\n' "$BLUE" "$NC" >&2
     printf '    %s[1]%s 仅 TCP\n    %s[2]%s 仅 UDP\n    %s[3]%s TCP+UDP\n' "$GREEN" "$NC" "$GREEN" "$NC" "$GREEN" "$NC" >&2
     if [[ -n $current ]]; then printf '    %s[0]%s 保持 %s\n' "$GREEN" "$NC" "${current^^}" >&2; fi
@@ -530,12 +606,14 @@ choose_protocol() {
         if [[ -n $current ]]; then read -r -p '  请选择 [0-3] (回车不改): ' choice || return 1
         else read -r -p '  请选择 [1-3] (默认 1): ' choice || return 1; fi
         case "$choice" in
-            '') printf '%s\n' "${current:-tcp}"; return ;;
-            0) if [[ -n $current ]]; then printf '%s\n' "$current"; return; fi ;;
-            1) printf 'tcp\n'; return ;;
-            2) printf 'udp\n'; return ;;
-            3) printf 'tcp+udp\n'; return ;;
+            '') selected=${current:-tcp} ;;
+            0) selected=$current ;;
+            1) selected=tcp ;;
+            2) selected=udp ;;
+            3) selected=tcp+udp ;;
+            *) selected='' ;;
         esac
+        if [[ -n $selected ]]; then printf -v "$result" '%s' "$selected"; return; fi
         fail '无效选择，请重新输入。'
     done
 }
@@ -551,12 +629,12 @@ edit_rule() {
             "$name" "$BLUE" "$port" "$NC" "$BLUE" "$value" "$NC" "$YELLOW" "${protocol^^}" "$NC"
         read -r -p "  新备注名称 (回车保持 $name): " value || return 1
         name=${value:-$name}
-        port=$(read_port '新本机监听端口' "$port") || return 1
+        read_port port '新本机监听端口' "$port" || return 1
     else
         printf '\n'
-        info '=== 添加端口转发规则 (引擎: Realm) ==='
+        info '=== 添加端口转发规则 ==='
         printf '\n'
-        port=$(read_port '请输入本机监听端口') || return 1
+        read_port port '请输入本机监听端口' || return 1
     fi
     while true; do
         if (( index >= 0 )); then
@@ -568,11 +646,11 @@ edit_rule() {
         if remote_address "$h" 1 >/dev/null; then host=$h; break; fi
     done
     if (( index >= 0 )); then
-        target=$(read_port '新目标端口' "$target") || return 1
+        read_port target '新目标端口' "$target" || return 1
     else
-        target=$(read_port '请输入目标端口') || return 1
+        read_port target '请输入目标端口' || return 1
     fi
-    protocol=$(choose_protocol "$protocol") || return 1
+    choose_protocol protocol "$protocol" || return 1
     if (( index < 0 )); then
         read -r -p "  请输入备注名称 (回车默认: 转发规则-$port): " name || return 1
     fi
@@ -611,7 +689,7 @@ uninstall() {
     read -r -p '  (y/N): ' answer || return 1
     [[ $answer == y || $answer == Y ]] || return 1
     check_service || return 1
-    if svc active; then svc stop || { fail '停止服务失败，未删除文件。'; return 1; }; fi
+    if [[ -f $UNIT ]] || svc active; then svc stop >/dev/null 2>&1 || { fail '停止服务失败，未删除文件。'; return 1; }; fi
     if svc enabled 2>/dev/null; then svc disable || { fail '取消自启失败，未删除文件。'; return 1; }; fi
     if svc active; then fail '服务仍在运行，未删除文件。'; return 1; fi
     svc reset >/dev/null 2>&1 || true
@@ -619,11 +697,11 @@ uninstall() {
     svc reload || return 1
     rm -rf -- "$DIR" || return 1
     rm -f -- "$LOG" "$LOG".* "$RT" "$LOCK" || return 1
-    printf '卸载完成：服务、核心、规则、备份、独立日志和 r 命令已清理。\n'
+    printf '  卸载完成：服务、核心、规则、备份、独立日志和 r 命令已清理。\n'
 }
 
 menu() {
-    local count choice index header_pad status
+    local count choice index header_pad
     MENU_INTERRUPTED=0
     trap 'MENU_INTERRUPTED=1' INT
     while true; do
@@ -632,6 +710,7 @@ menu() {
         header_pad=$((7-${#count})); (( header_pad > 0 )) || header_pad=1
         printf '\n%s  ╔═══════════════════════════════════════╗\n' "$BLUE"
         printf '  ║    端口转发管理 (当前规则: %s%s%s 条)%*s║\n' "$GREEN" "$count" "$BLUE" "$header_pad" ''
+        printf '  ║  管理脚本: %sv%s%s%*s║\n' "$GREEN" "$SCRIPT_VERSION" "$BLUE" "$((26-${#SCRIPT_VERSION}))" ''
         printf '  ╠═══════════════════════════════════════╣\n'
         printf '  ║  %s[1]%s 添加转发规则%21s║\n' "$GREEN" "$BLUE" ''
         printf '  ║  %s[2]%s 查看当前转发规则%17s║\n' "$GREEN" "$BLUE" ''
@@ -653,14 +732,13 @@ menu() {
         case "$choice" in
             1) edit_rule || true ;;
             2) view_rules ;;
-            3) index=$(choose_rule '修改') && edit_rule "$index" || true ;;
-            4) index=$(choose_rule '删除') && delete_rules "$index" || true ;;
+            3) choose_rule index '修改' && edit_rule "$index" || true ;;
+            4) choose_rule index '删除' && delete_rules "$index" || true ;;
             5) delete_rules -1 || true ;;
             6) printf '\n'; info '=== 更新 Realm ==='; printf '\n'; update_realm || true ;;
             7)
                 printf '\n'; info '=== 更新管理脚本 ==='; printf '\n'
-                if update_script; then status=0; else status=$?; fi
-                if (( status == 10 )); then pause_enter; reload_script; return; fi
+                if update_script; then pause_enter; reload_script; return; fi
                 ;;
             8) if uninstall; then trap - INT; return 0; fi ;;
             0) trap - INT; return 0 ;;
@@ -671,11 +749,12 @@ menu() {
 }
 
 main() {
-    local command=${0##*/} status
+    local command=${0##*/}
     case "${1:-}" in
-        -h|--help) printf '用法：%s [--update|--update-script|--uninstall]\n不带参数打开管理菜单；--update 更新 Realm；--update-script 更新管理脚本；--uninstall 卸载并清理全部规则。\n' "$command"; return 0 ;;
-        ''|--update|--update-script|--uninstall) ;;
-        *) fail "用法：$command [--update|--update-script|--uninstall]"; return 1 ;;
+        -v|--version) printf 'Realm 管理脚本 v%s\n' "$SCRIPT_VERSION"; return 0 ;;
+        -h|--help) printf '用法：%s [--install|--update|--update-script|--uninstall|--version]\n不带参数打开管理菜单；--install 安装管理命令；--update 更新 Realm；--update-script 更新管理脚本；--uninstall 卸载并清理全部规则；--version 查看管理脚本版本。\n' "$command"; return 0 ;;
+        ''|--install|--update|--update-script|--uninstall) ;;
+        *) fail "用法：$command [--install|--update|--update-script|--uninstall|--version]"; return 1 ;;
     esac
     [[ $(uname -s) == Linux && $EUID == 0 ]] || {
         fail '请在 Linux VPS/容器中以 root 或 sudo 运行。'; return 1;
@@ -685,10 +764,8 @@ main() {
     mkdir -p /run/lock || return 1
     acquire_lock || return 1
     trap 'exit 0' TERM HUP
-    if [[ ${1:-} == --update-script ]]; then
-        if update_script; then status=0; else status=$?; fi
-        if (( status == 10 )); then reload_script; else return "$status"; fi
-    fi
+    if [[ ${1:-} == --install ]]; then install_script && reload_script; return; fi
+    if [[ ${1:-} == --update-script ]]; then update_script && reload_script; return; fi
     check_service || return 1
     if [[ ${1:-} == --uninstall ]]; then uninstall; return; fi
     mkdir -p "$DIR" && init_config || return 1
