@@ -335,7 +335,7 @@ update_script() (
     trap cleanup_script_update EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM HUP
-    printf '正在获取最新管理脚本……\n'
+    printf '  正在获取最新管理脚本...\n'
     get "$SCRIPT_URL" "$temp" || { fail '管理脚本下载失败，请检查 GitHub 连接。'; exit 1; }
     IFS= read -r first_line < "$temp" || true
     [[ $first_line == '#!/bin/sh' ]] || { fail '下载内容不是有效的管理脚本。'; exit 1; }
@@ -344,7 +344,7 @@ update_script() (
         new_hash=$(sha256sum "$temp") || exit 1
         old_hash=$(sha256sum "$RT") || exit 1
         if [[ ${new_hash%% *} == "${old_hash%% *}" ]]; then
-            printf '管理脚本已是最新版。\n'
+            printf '  管理脚本已是最新版。\n'
             exit 0
         fi
     fi
@@ -517,7 +517,7 @@ choose_protocol() {
     local current=${1:-} choice
     printf '\n  %s请选择转发协议：%s\n' "$BLUE" "$NC" >&2
     printf '    %s[1]%s 仅 TCP\n    %s[2]%s 仅 UDP\n    %s[3]%s TCP+UDP\n' "$GREEN" "$NC" "$GREEN" "$NC" "$GREEN" "$NC" >&2
-    if [[ -n $current ]]; then printf '    %s[0]%s 保持 %s\n' "$YELLOW" "$NC" "${current^^}" >&2; fi
+    if [[ -n $current ]]; then printf '    %s[0]%s 保持 %s\n' "$GREEN" "$NC" "${current^^}" >&2; fi
     while true; do
         if [[ -n $current ]]; then read -r -p '  请选择 [0-3] (回车不改): ' choice || return 1
         else read -r -p '  请选择 [1-3] (默认 1): ' choice || return 1; fi
@@ -629,11 +629,11 @@ menu() {
         printf '  ║  %s[2]%s 查看当前转发规则%17s║\n' "$GREEN" "$BLUE" ''
         printf '  ║  %s[3]%s 修改转发规则%21s║\n' "$GREEN" "$BLUE" ''
         printf '  ║  %s[4]%s 删除转发规则%21s║\n' "$GREEN" "$BLUE" ''
-        printf '  ║  %s[5]%s 清空所有转发规则%17s║\n' "$YELLOW" "$BLUE" ''
+        printf '  ║  %s[5]%s 清空所有转发规则%17s║\n' "$GREEN" "$BLUE" ''
         printf '  ║  %s[6]%s 更新 Realm%23s║\n' "$GREEN" "$BLUE" ''
         printf '  ║  %s[7]%s 更新管理脚本%21s║\n' "$GREEN" "$BLUE" ''
-        printf '  ║  %s[8]%s 一键卸载%25s║\n' "$YELLOW" "$BLUE" ''
-        printf '  ║  %s[0]%s 退出脚本%25s║\n' "$YELLOW" "$BLUE" ''
+        printf '  ║  %s[8]%s 一键卸载%25s║\n' "$GREEN" "$BLUE" ''
+        printf '  ║  %s[0]%s 退出脚本%25s║\n' "$GREEN" "$BLUE" ''
         printf '  ╚═══════════════════════════════════════╝%s\n\n' "$NC"
         MENU_INTERRUPTED=0
         if ! read -r -p '  请输入选项 [0-8]: ' choice; then
