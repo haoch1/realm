@@ -307,13 +307,21 @@ apply_rules() (
 )
 
 view_rules() {
-    info '当前端口转发规则'
-    if [[ $(jq '.endpoints|length' "$CONF") == 0 ]]; then printf '  暂无转发规则。\n'; return; fi
-    jq -r --arg green "$GREEN" --arg blue "$BLUE" --arg yellow "$YELLOW" --arg nc "$NC" "$JQ_PROTOCOL"'
+    local index name listen remote protocol port count
+    count=$(jq '.endpoints|length' "$CONF") || return 1
+    printf '\n  %s=== 当前端口转发规则 ===%s\n\n' "$BLUE" "$NC"
+    if (( count == 0 )); then printf '  暂无转发规则。\n'; return; fi
+    while IFS=$'\t' read -r index name listen remote protocol; do
+        port=${listen##*:}
+        printf '  %s[%s]%s 【%s】 本机 :%s%s%s → %s%s%s  %s[%s]%s\n' \
+            "$GREEN" "$index" "$NC" "$name" "$BLUE" "$port" "$NC" \
+            "$BLUE" "$remote" "$NC" "$YELLOW" "$protocol" "$NC"
+    done < <(jq -r "$JQ_PROTOCOL"'
         .network as $g | .endpoints | to_entries[]
         | .value as $v | ($v | protocol($g) | ascii_upcase) as $proto
         | ($v.name // ("转发规则-" + ($v.listen | split(":") | last))) as $name
-        | "  \($green)[\(.key+1)]\($nc) 【\($name)】 \($blue)\($v.listen) → \($v.remote)\($nc)  [\($yellow)\($proto)\($nc)]"' "$CONF"
+        | [(.key+1), $name, $v.listen, $v.remote, $proto] | @tsv' "$CONF")
+    printf '\n  共 %s%s%s 条转发规则。\n' "$GREEN" "$count" "$NC"
 }
 
 choose_rule() {
@@ -460,21 +468,24 @@ uninstall() {
 }
 
 menu() {
-    local count choice index current state
+    local count choice index header_pad
     while true; do
         [[ -t 1 ]] && printf '\033[2J\033[H'
         count=$(jq '.endpoints|length' "$CONF") || return 1
-        current=$(version "$BIN" 2>/dev/null) || current='未安装'
-        printf '\n%s  ╔══════════════════════════════════════════════╗\n' "$BLUE"
-        printf '  ║  端口转发管理 · Realm                       ║\n'
-        printf '  ╚══════════════════════════════════════════════╝%s\n' "$NC"
-        printf '     当前规则：%s%s%s 条\n\n' "$GREEN" "$count" "$NC"
-        state='未运行'; (( count )) || state='待添加规则'
-        if svc active; then state='运行中'; fi
-        printf '     Realm：%s  |  状态：%s\n\n' "${current:-未安装}" "$state"
-        printf '     [1] 添加转发规则\n     [2] 查看当前转发规则\n     [3] 修改转发规则\n     [4] 删除转发规则\n'
-        printf '     %s[5] 清空所有转发规则%s\n     [6] 更新 Realm\n     %s[7] 一键卸载%s\n     [0] 退出脚本\n\n' "$RED" "$NC" "$RED" "$NC"
-        read -r -p '请输入选项 [0-7]：' choice || return 0
+        header_pad=$((7-${#count})); (( header_pad > 0 )) || header_pad=1
+        printf '\n%s  ╔═══════════════════════════════════════╗\n' "$BLUE"
+        printf '  ║    端口转发管理 (当前规则: %s%s%s 条)%*s║\n' "$GREEN" "$count" "$BLUE" "$header_pad" ''
+        printf '  ╠═══════════════════════════════════════╣\n'
+        printf '  ║  %s[1]%s 添加转发规则%21s║\n' "$GREEN" "$BLUE" ''
+        printf '  ║  %s[2]%s 查看当前转发规则%17s║\n' "$GREEN" "$BLUE" ''
+        printf '  ║  %s[3]%s 修改转发规则%21s║\n' "$GREEN" "$BLUE" ''
+        printf '  ║  %s[4]%s 删除转发规则%21s║\n' "$GREEN" "$BLUE" ''
+        printf '  ║  %s[5]%s 清空所有转发规则%17s║\n' "$RED" "$BLUE" ''
+        printf '  ║  %s[6]%s 更新 Realm%23s║\n' "$GREEN" "$BLUE" ''
+        printf '  ║  %s[7]%s 一键卸载%25s║\n' "$RED" "$BLUE" ''
+        printf '  ║  %s[0]%s 退出脚本%25s║\n' "$YELLOW" "$BLUE" ''
+        printf '  ╚═══════════════════════════════════════╝%s\n\n' "$NC"
+        read -r -p '  请输入选项 [0-7]: ' choice || return 0
         case "$choice" in
             1) edit_rule || true ;;
             2) view_rules ;;
@@ -486,7 +497,7 @@ menu() {
             0) return 0 ;;
             *) fail '无效选项。' ;;
         esac
-        read -r -p '按回车继续……' choice || return 0
+        read -r -p '  按回车继续……' choice || return 0
     done
 }
 
