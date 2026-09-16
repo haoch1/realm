@@ -29,7 +29,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
 fi
 
 DIR=/root/realm
-SCRIPT_VERSION=1.0.2
+SCRIPT_VERSION=1.0.3
 BIN=$DIR/realm
 CONF=$DIR/config.json
 UNIT=/etc/systemd/system/realm.service
@@ -81,10 +81,11 @@ version() {
 
 dependencies() {
     local cmd missing=0
-    for cmd in curl jq tar sha256sum timeout flock ss pgrep; do command -v "$cmd" >/dev/null || missing=1; done
+    local -a required=(curl jq tar sha256sum timeout flock ss pgrep)
+    for cmd in "${required[@]}"; do command -v "$cmd" >/dev/null || missing=1; done
     (( missing )) || return 0
     install_packages || return 1
-    for cmd in curl jq tar sha256sum timeout flock ss pgrep; do command -v "$cmd" >/dev/null || return 1; done
+    for cmd in "${required[@]}"; do command -v "$cmd" >/dev/null || return 1; done
 }
 
 is_manager_pid() {
@@ -257,19 +258,21 @@ init_config() {
 }
 
 select_asset() {
-    local json=$1 arch=$2 target
+    local json=$1 arch=$2 target release
     case "$arch" in
         x86_64|amd64) target=x86_64-unknown-linux-musl ;;
         aarch64|arm64) target=aarch64-unknown-linux-musl ;;
         armv7l|armv7) target=armv7-unknown-linux-musleabihf ;;
         *) fail "暂不支持架构：$arch"; return 1 ;;
     esac
-    jq -e '.draft == false and .prerelease == false' "$json" >/dev/null || return 1
-    TAG=$(jq -er '.tag_name' "$json") || return 1
-    [[ $TAG =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]] || { fail '无法识别稳定版标签。'; return 1; }
     local name="realm-$target.tar.gz"
-    URL=$(jq -er --arg name "$name" '.assets[] | select(.name==$name) | .browser_download_url' "$json") || return 1
-    HASH=$(jq -er --arg name "$name" '.assets[] | select(.name==$name) | .digest' "$json") || return 1
+    release=$(jq -er --arg name "$name" '
+        select(.draft == false and .prerelease == false) | .tag_name as $tag
+        | .assets[] | select(.name == $name)
+        | [$tag, .browser_download_url, .digest] | @tsv' "$json") || return 1
+    [[ $release != *$'\n'* ]] || { fail '安装包信息重复。'; return 1; }
+    IFS=$'\t' read -r TAG URL HASH <<< "$release"
+    [[ $TAG =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]] || { fail '无法识别稳定版标签。'; return 1; }
     [[ $URL == "https://github.com/zhboner/realm/releases/download/$TAG/$name" && $HASH =~ ^sha256:[a-f0-9]{64}$ ]] || {
         fail '安装包地址或 SHA256 摘要无效。'; return 1;
     }
@@ -351,12 +354,9 @@ update_realm() (
 )
 
 update_script() (
-    local target_dir temp first_line new_hash old_hash new_version
-    target_dir=${RT%/*}
-    [[ $target_dir != "$RT" ]] || target_dir=.
-    temp=$(mktemp "$target_dir/.realm-manager.XXXXXX") || exit 1
-    cleanup_script_update() { [[ -z ${temp:-} ]] || rm -f -- "$temp"; }
-    trap cleanup_script_update EXIT
+    local temp first_line new_hash old_hash new_version
+    temp=$(mktemp "${RT%/*}/.realm-manager.XXXXXX") || exit 1
+    trap 'rm -f -- "$temp"' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM HUP
     printf '  正在获取最新管理脚本...\n'
@@ -386,17 +386,6 @@ reload_script() {
     exec bash "$RT"
     fail '无法重新加载管理脚本，请重新运行 r。'
 }
-
-install_script() (
-    local temp
-    mkdir -p "${RT%/*}" || exit 1
-    temp=$(mktemp "${RT%/*}/.realm-manager.XXXXXX") || exit 1
-    trap 'rm -f -- "$temp"' EXIT
-    trap 'exit 130' INT
-    trap 'exit 143' TERM HUP
-    cp -- "${BASH_SOURCE[0]}" "$temp" && bash -n "$temp" &&
-        chmod 755 "$temp" && mv -f "$temp" "$RT" || exit 1
-)
 
 valid_port() { [[ $1 =~ ^[0-9]{1,5}$ ]] && (( 10#$1 > 0 && 10#$1 < 65536 )); }
 
@@ -543,7 +532,7 @@ choose_rule() {
 
 save_rule() {
     local index=$1 port=$2 host=$3 target=$4 protocol=${5:-tcp} name=${6:-}
-    local remote current old_protocol temp proto flag sockets pid=''
+    local remote current='' old_protocol='' temp proto flag sockets pid=''
     case "$protocol" in tcp|udp|tcp+udp) ;; *) fail '请选择 TCP、UDP 或 TCP+UDP。'; return 1 ;; esac
     valid_port "$port" || { fail '监听端口应为 1–65535。'; return 1; }
     port=$((10#$port))
@@ -555,11 +544,15 @@ save_rule() {
             .key != $i and (.value.listen | split(":") | last)==$p
             and ((.value | protocol($g)) as $old | $old==$proto or $old=="tcp+udp" or $proto=="tcp+udp"))' "$CONF" >/dev/null; then
         fail "${protocol^^} 端口 $port 已有转发规则。"; return 1
+    else
+        [[ $? == 1 ]] || return 1
     fi
-    current=$(jq -r --argjson i "$index" 'if $i<0 then "" else .endpoints[$i].listen end' "$CONF") || return 1
-    old_protocol=$(jq -r --argjson i "$index" "$JQ_PROTOCOL"'
-        .network as $g | if $i<0 then "" else .endpoints[$i] | protocol($g) end' "$CONF") || return 1
-    if svc active; then pid=$(svc pid) || pid=''; fi
+    if (( index >= 0 )); then
+        current=$(jq -r --argjson i "$index" '.endpoints[$i].listen' "$CONF") || return 1
+        old_protocol=$(jq -r --argjson i "$index" "$JQ_PROTOCOL"'
+            .network as $g | .endpoints[$i] | protocol($g)' "$CONF") || return 1
+        if svc active; then pid=$(svc pid) || pid=''; fi
+    fi
     for proto in tcp udp; do
         [[ $protocol == "$proto" || $protocol == tcp+udp ]] || continue
         flag=-ltnp; [[ $proto != udp ]] || flag=-uanp
@@ -604,13 +597,15 @@ read_port() {
 }
 
 choose_protocol() {
-    local result=$1 current=${2:-} choice selected
+    local result=$1 current=${2:-} choice selected prompt='  请选择 [1-3] (默认 1): '
     printf '\n  %s请选择转发协议：%s\n' "$BLUE" "$NC" >&2
     printf '    %s[1]%s 仅 TCP\n    %s[2]%s 仅 UDP\n    %s[3]%s TCP+UDP\n' "$GREEN" "$NC" "$GREEN" "$NC" "$GREEN" "$NC" >&2
-    if [[ -n $current ]]; then printf '    %s[0]%s 保持 %s\n' "$GREEN" "$NC" "${current^^}" >&2; fi
+    if [[ -n $current ]]; then
+        printf '    %s[0]%s 保持 %s\n' "$GREEN" "$NC" "${current^^}" >&2
+        prompt='  请选择 [0-3] (回车不改): '
+    fi
     while true; do
-        if [[ -n $current ]]; then read_input choice '  请选择 [0-3] (回车不改): ' || return 1
-        else read_input choice '  请选择 [1-3] (默认 1): ' || return 1; fi
+        read_input choice "$prompt" || return 1
         case "$choice" in
             '') selected=${current:-tcp} ;;
             0) selected=$current ;;
@@ -626,37 +621,34 @@ choose_protocol() {
 
 edit_rule() {
     local index=${1:--1} port='' host='' target='' protocol='' name='' value h
+    local host_prompt='  请输入目标地址 (IP 或域名): ' target_label='请输入目标端口'
     if (( index >= 0 )); then
-        value=$(jq -r --argjson i "$index" '.endpoints[$i].listen' "$CONF"); port=${value##*:}
-        value=$(jq -r --argjson i "$index" '.endpoints[$i].remote' "$CONF"); target=${value##*:}; host=${value%:*}
+        value=$(jq -r --argjson i "$index" '.endpoints[$i].listen' "$CONF") || return 1
+        port=${value##*:}
+        value=$(jq -r --argjson i "$index" '.endpoints[$i].remote' "$CONF") || return 1
+        target=${value##*:}; host=${value%:*}
         protocol=$(jq -r --argjson i "$index" "$JQ_PROTOCOL"' .network as $g | .endpoints[$i] | protocol($g)' "$CONF") || return 1
         name=$(jq -r --argjson i "$index" --arg fallback "转发规则-$port" '.endpoints[$i].name // $fallback' "$CONF") || return 1
         printf '\n  当前规则: 【%s】 本机 :%s%s%s → %s%s%s  [%s%s%s]\n\n' \
             "$name" "$BLUE" "$port" "$NC" "$BLUE" "$value" "$NC" "$YELLOW" "${protocol^^}" "$NC"
-        printf '  输入 q 或按 Ctrl+C 取消，按回车保留原值。\n\n'
+        printf '  输入 q 取消，按回车保留原值。\n\n'
         read_input value "  新备注名称 (回车保持 $name): " || return 1
         name=${value:-$name}
         read_port port '新本机监听端口' "$port" || return 1
+        host_prompt="  新目标地址 (回车保持 $host): "
+        target_label='新目标端口'
     else
         printf '\n'
         info '=== 添加端口转发规则 ==='
-        printf '\n  输入 q 或按 Ctrl+C 取消。\n\n'
+        printf '\n  输入 q 取消。\n\n'
         read_port port '请输入本机监听端口' || return 1
     fi
     while true; do
-        if (( index >= 0 )); then
-            read_input h "  新目标地址 (回车保持 $host): " || return 1
-        else
-            read_input h '  请输入目标地址 (IP 或域名): ' || return 1
-        fi
+        read_input h "$host_prompt" || return 1
         h=${h:-$host}
         if remote_address "$h" 1 >/dev/null; then host=$h; break; fi
     done
-    if (( index >= 0 )); then
-        read_port target '新目标端口' "$target" || return 1
-    else
-        read_port target '请输入目标端口' || return 1
-    fi
+    read_port target "$target_label" "$target" || return 1
     choose_protocol protocol "$protocol" || return 1
     if (( index < 0 )); then
         read_input name "  请输入备注名称 (回车默认: 转发规则-$port): " || return 1
@@ -759,9 +751,9 @@ main() {
     local command=${0##*/}
     case "${1:-}" in
         -v|--version) printf 'Realm 管理脚本 v%s\n' "$SCRIPT_VERSION"; return 0 ;;
-        -h|--help) printf '用法：%s [--install|--update|--update-script|--uninstall|--version]\n不带参数打开管理菜单；--install 安装管理命令；--update 更新 Realm；--update-script 更新管理脚本；--uninstall 卸载并清理全部规则；--version 查看管理脚本版本。\n' "$command"; return 0 ;;
-        ''|--install|--update|--update-script|--uninstall) ;;
-        *) fail "用法：$command [--install|--update|--update-script|--uninstall|--version]"; return 1 ;;
+        -h|--help) printf '用法：%s [--update|--update-script|--uninstall|--version]\n不带参数打开管理菜单；--update 更新 Realm；--update-script 更新管理脚本；--uninstall 卸载并清理全部规则；--version 查看管理脚本版本。\n' "$command"; return 0 ;;
+        ''|--update|--update-script|--uninstall) ;;
+        *) fail "用法：$command [--update|--update-script|--uninstall|--version]"; return 1 ;;
     esac
     [[ $(uname -s) == Linux && $EUID == 0 ]] || {
         fail '请在 Linux VPS/容器中以 root 或 sudo 运行。'; return 1;
@@ -771,7 +763,6 @@ main() {
     mkdir -p /run/lock || return 1
     acquire_lock || return 1
     trap 'exit 0' TERM HUP
-    if [[ ${1:-} == --install ]]; then install_script && reload_script; return; fi
     if [[ ${1:-} == --update-script ]]; then update_script && reload_script; return; fi
     check_service || return 1
     if [[ ${1:-} == --uninstall ]]; then uninstall; return; fi
