@@ -29,7 +29,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
 fi
 
 DIR=/root/realm
-SCRIPT_VERSION=1.0.5
+SCRIPT_VERSION=1.0.6
 BIN=$DIR/realm
 CONF=$DIR/config.json
 UNIT=/etc/systemd/system/realm.service
@@ -699,7 +699,8 @@ delete_rules() {
 }
 
 uninstall() {
-    local answer
+    local answer startup="$RUNLEVEL/realm"
+    [[ $INIT != systemd ]] || startup="${UNIT%/*}/multi-user.target.wants/realm.service"
     printf '\n'
     info '=== 一键卸载 Realm ==='
     printf '\n'
@@ -711,8 +712,9 @@ uninstall() {
     if svc enabled 2>/dev/null; then svc disable || { fail '取消自启失败，未删除文件。'; return 1; }; fi
     if svc active; then fail '服务仍在运行，未删除文件。'; return 1; fi
     svc reset >/dev/null 2>&1 || true
-    rm -f -- "$UNIT" "$UNIT.bak" || return 1
+    rm -f -- "$UNIT" "$UNIT.bak" "$startup" || return 1
     svc reload || return 1
+    rm -f -- "${RT%/*}"/.realm-manager.?????? || return 1
     rm -rf -- "$DIR" || return 1
     rm -f -- "$LOG" "$LOG".* "$RT" "$LOCK" || return 1
     printf '  卸载完成：服务、核心、规则、备份、独立日志和 r 命令已清理。\n'
