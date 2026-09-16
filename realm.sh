@@ -38,6 +38,7 @@ RT=/usr/local/bin/r
 LOG=/var/log/realm.log
 LOCK=/run/lock/realm-manager.lock
 API=https://api.github.com/repos/zhboner/realm/releases/latest
+SCRIPT_URL=https://raw.githubusercontent.com/haoch1/realm/main/realm.sh
 BLUE=$'\033[1;36m' GREEN=$'\033[0;32m' RED=$'\033[0;31m' YELLOW=$'\033[0;33m' NC=$'\033[0m'
 # Endpoint 的非空设置覆盖全局值；显式 false 也必须保留。
 JQ_PROTOCOL='def protocol($global):
@@ -73,10 +74,76 @@ version() {
 
 dependencies() {
     local cmd missing=0
-    for cmd in curl jq tar sha256sum timeout flock ss pgrep; do command -v "$cmd" >/dev/null || missing=1; done
+    for cmd in curl jq tar sha256sum timeout flock ss pgrep stat; do command -v "$cmd" >/dev/null || missing=1; done
     (( missing )) || return 0
     install_packages || return 1
-    for cmd in curl jq tar sha256sum timeout flock ss pgrep; do command -v "$cmd" >/dev/null || return 1; done
+    for cmd in curl jq tar sha256sum timeout flock ss pgrep stat; do command -v "$cmd" >/dev/null || return 1; done
+}
+
+is_manager_pid() {
+    local pid=$1 command
+    [[ -r /proc/$pid/cmdline ]] || return 1
+    command=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null) || return 1
+    [[ $command == *'/usr/local/bin/r'* || $command == *'/realm.sh'* || $command == *' realm.sh '* ]]
+}
+
+lock_holder_pid() {
+    local inode pid fd fd_inode
+    pid=$(cat "$LOCK" 2>/dev/null) || pid=''
+    if [[ $pid =~ ^[1-9][0-9]*$ ]] && (( pid != $$ )) && kill -0 "$pid" 2>/dev/null && is_manager_pid "$pid"; then
+        printf '%s\n' "$pid"
+        return 0
+    fi
+
+    inode=$(stat -Lc '%i' "$LOCK" 2>/dev/null) || inode=''
+    if [[ -n $inode && -r /proc/locks ]]; then
+        pid=$(awk -v inode="$inode" '$2=="FLOCK" && $6 ~ (":" inode "$") {print $5; exit}' /proc/locks)
+        if [[ $pid =~ ^[1-9][0-9]*$ ]] && (( pid != $$ )) && kill -0 "$pid" 2>/dev/null && is_manager_pid "$pid"; then
+            printf '%s\n' "$pid"
+            return 0
+        fi
+    fi
+
+    # 兼容旧脚本留下的空锁文件；BSD flock 可能记录已经退出的 flock 子进程 PID。
+    [[ -n $inode ]] || return 1
+    for fd in /proc/[0-9]*/fd/*; do
+        [[ -e $fd ]] || continue
+        fd_inode=$(stat -Lc '%i' "$fd" 2>/dev/null) || continue
+        [[ $fd_inode == "$inode" ]] || continue
+        pid=${fd#/proc/}
+        pid=${pid%%/*}
+        [[ $pid =~ ^[1-9][0-9]*$ ]] && (( pid != $$ )) && is_manager_pid "$pid" || continue
+        printf '%s\n' "$pid"
+        return 0
+    done
+    return 1
+}
+
+acquire_lock() {
+    local holder attempt
+    exec 9>>"$LOCK" || { fail '无法打开管理锁。'; return 1; }
+    if flock -n 9; then
+        printf '%s\n' "$$" > "$LOCK"
+        return 0
+    fi
+
+    holder=$(lock_holder_pid 2>/dev/null) || holder=''
+    if [[ $holder =~ ^[1-9][0-9]*$ ]] && kill -0 "$holder" 2>/dev/null && is_manager_pid "$holder"; then
+        info '检测到旧的管理界面，正在自动接管...'
+        kill -TERM "$holder" 2>/dev/null || true
+        for (( attempt=0; attempt<50; attempt++ )); do
+            if flock -n 9; then
+                printf '%s\n' "$$" > "$LOCK"
+                success '已关闭旧管理界面。'
+                return 0
+            fi
+            sleep 0.1
+        done
+        fail "旧管理脚本仍在执行操作，请稍后重试（PID: $holder）。"
+        return 1
+    fi
+
+    fail "管理锁被其他进程占用${holder:+（PID: $holder）}，请稍后重试。"
 }
 
 detect_init() {
@@ -257,6 +324,33 @@ update_realm() (
     if (( active )); then svc restart && ready || exit 1; fi
     replaced=0
     printf 'Realm 已更新至 %s。\n' "$TAG"
+)
+
+update_script() (
+    local target_dir temp first_line new_hash old_hash
+    target_dir=${RT%/*}
+    [[ $target_dir != "$RT" ]] || target_dir=.
+    temp=$(mktemp "$target_dir/.realm-manager.XXXXXX") || exit 1
+    cleanup_script_update() { [[ -z ${temp:-} ]] || rm -f -- "$temp"; }
+    trap cleanup_script_update EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM HUP
+    printf '正在获取最新管理脚本……\n'
+    get "$SCRIPT_URL" "$temp" || { fail '管理脚本下载失败，请检查 GitHub 连接。'; exit 1; }
+    IFS= read -r first_line < "$temp" || true
+    [[ $first_line == '#!/bin/sh' ]] || { fail '下载内容不是有效的管理脚本。'; exit 1; }
+    bash -n "$temp" || { fail '新版管理脚本语法检查失败，未替换当前版本。'; exit 1; }
+    if [[ -f $RT ]]; then
+        new_hash=$(sha256sum "$temp") || exit 1
+        old_hash=$(sha256sum "$RT") || exit 1
+        if [[ ${new_hash%% *} == "${old_hash%% *}" ]]; then
+            printf '管理脚本已是最新版。\n'
+            exit 0
+        fi
+    fi
+    chmod 755 "$temp" && mv -f "$temp" "$RT" || { fail '管理脚本替换失败。'; exit 1; }
+    trap - EXIT INT TERM HUP
+    success '管理脚本已更新，重新运行 r 即可使用。'
 )
 
 valid_port() { [[ $1 =~ ^[0-9]{1,5}$ ]] && (( 10#$1 > 0 && 10#$1 < 65536 )); }
@@ -535,13 +629,14 @@ menu() {
         printf '  ║  %s[2]%s 查看当前转发规则%17s║\n' "$GREEN" "$BLUE" ''
         printf '  ║  %s[3]%s 修改转发规则%21s║\n' "$GREEN" "$BLUE" ''
         printf '  ║  %s[4]%s 删除转发规则%21s║\n' "$GREEN" "$BLUE" ''
-        printf '  ║  %s[5]%s 清空所有转发规则%17s║\n' "$RED" "$BLUE" ''
+        printf '  ║  %s[5]%s 清空所有转发规则%17s║\n' "$YELLOW" "$BLUE" ''
         printf '  ║  %s[6]%s 更新 Realm%23s║\n' "$GREEN" "$BLUE" ''
-        printf '  ║  %s[7]%s 一键卸载%25s║\n' "$RED" "$BLUE" ''
+        printf '  ║  %s[7]%s 更新管理脚本%21s║\n' "$GREEN" "$BLUE" ''
+        printf '  ║  %s[8]%s 一键卸载%25s║\n' "$YELLOW" "$BLUE" ''
         printf '  ║  %s[0]%s 退出脚本%25s║\n' "$YELLOW" "$BLUE" ''
         printf '  ╚═══════════════════════════════════════╝%s\n\n' "$NC"
         MENU_INTERRUPTED=0
-        if ! read -r -p '  请输入选项 [0-7]: ' choice; then
+        if ! read -r -p '  请输入选项 [0-8]: ' choice; then
             if (( MENU_INTERRUPTED )); then pause_menu; continue; fi
             trap - INT
             return 0
@@ -554,7 +649,8 @@ menu() {
             4) index=$(choose_rule '删除') && delete_rules "$index" || true ;;
             5) delete_rules -1 || true ;;
             6) printf '\n'; info '=== 更新 Realm ==='; printf '\n'; update_realm || true ;;
-            7) if uninstall; then trap - INT; return 0; fi ;;
+            7) printf '\n'; info '=== 更新管理脚本 ==='; printf '\n'; update_script || true ;;
+            8) if uninstall; then trap - INT; return 0; fi ;;
             0) trap - INT; return 0 ;;
             *) fail '无效选项。' ;;
         esac
@@ -565,9 +661,9 @@ menu() {
 main() {
     local command=${0##*/}
     case "${1:-}" in
-        -h|--help) printf '用法：%s [--update|--uninstall]\n不带参数打开管理菜单；--update 更新 Realm；--uninstall 卸载并清理全部规则。\n' "$command"; return 0 ;;
-        ''|--update|--uninstall) ;;
-        *) fail "用法：$command [--update|--uninstall]"; return 1 ;;
+        -h|--help) printf '用法：%s [--update|--update-script|--uninstall]\n不带参数打开管理菜单；--update 更新 Realm；--update-script 更新管理脚本；--uninstall 卸载并清理全部规则。\n' "$command"; return 0 ;;
+        ''|--update|--update-script|--uninstall) ;;
+        *) fail "用法：$command [--update|--update-script|--uninstall]"; return 1 ;;
     esac
     [[ $(uname -s) == Linux && $EUID == 0 ]] || {
         fail '请在 Linux VPS/容器中以 root 或 sudo 运行。'; return 1;
@@ -575,8 +671,9 @@ main() {
     umask 077
     detect_init && dependencies || return 1
     mkdir -p /run/lock || return 1
-    exec 9>"$LOCK" || return 1
-    flock -n 9 || { fail '另一个管理脚本正在运行。'; return 1; }
+    acquire_lock || return 1
+    trap 'exit 0' TERM HUP
+    if [[ ${1:-} == --update-script ]]; then update_script; return; fi
     check_service || return 1
     if [[ ${1:-} == --uninstall ]]; then uninstall; return; fi
     mkdir -p "$DIR" && init_config || return 1
