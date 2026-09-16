@@ -46,8 +46,19 @@ JQ_PROTOCOL='def protocol($global):
       elif $n.use_udp == true then "tcp+udp" else "tcp" end;'
 
 fail() { printf '  %s[错误] %s%s\n' "$RED" "$*" "$NC" >&2; return 1; }
-info() { printf '\n  %s=== %s ===%s\n\n' "$BLUE" "$*" "$NC"; }
+info() { printf '  %s[信息] %s%s\n' "$BLUE" "$*" "$NC"; }
+warn() { printf '  %s[注意] %s%s\n' "$YELLOW" "$*" "$NC"; }
 success() { printf '  %s[成功] %s%s\n' "$GREEN" "$*" "$NC"; }
+pause_enter() { read -r -p '  按回车继续...' _ || true; }
+pause_menu() {
+    printf '\n'
+    if [[ -t 0 ]]; then
+        read -r -s -n 1 -p '  按任意键返回主菜单...' _ || true
+        printf '\n'
+    else
+        read -r -p '  按任意键返回主菜单...' _ || true
+    fi
+}
 get() { curl -fLsS --retry 2 --connect-timeout 15 --max-time 180 --proto '=https' --proto-redir '=https' "$1" -o "$2"; }
 version() {
     local output
@@ -297,20 +308,16 @@ apply_rules() (
     changed=1
     chmod 600 "$candidate" && mv -f "$candidate" "$CONF" || exit 1
     if (( count )); then
-        write_unit && svc enable && svc restart && ready || exit 1
+        write_unit && svc enable >/dev/null 2>&1 && svc restart >/dev/null 2>&1 && ready || exit 1
     elif (( had_unit )); then
-        svc stop || exit 1
-        if (( enabled )); then svc disable || exit 1; fi
+        svc stop >/dev/null 2>&1 || exit 1
+        if (( enabled )); then svc disable >/dev/null 2>&1 || exit 1; fi
     fi
     changed=0
-    success '规则已生效。'
 )
 
-view_rules() {
-    local index name listen remote protocol port count
-    count=$(jq '.endpoints|length' "$CONF") || return 1
-    printf '\n  %s=== 当前端口转发规则 ===%s\n\n' "$BLUE" "$NC"
-    if (( count == 0 )); then printf '  暂无转发规则。\n'; return; fi
+print_rules() {
+    local index name listen remote protocol port
     while IFS=$'\t' read -r index name listen remote protocol; do
         port=${listen##*:}
         printf '  %s[%s]%s 【%s】 本机 :%s%s%s → %s%s%s  %s[%s]%s\n' \
@@ -321,17 +328,31 @@ view_rules() {
         | .value as $v | ($v | protocol($g) | ascii_upcase) as $proto
         | ($v.name // ("转发规则-" + ($v.listen | split(":") | last))) as $name
         | [(.key+1), $name, $v.listen, $v.remote, $proto] | @tsv' "$CONF")
+}
+
+view_rules() {
+    local count
+    count=$(jq '.endpoints|length' "$CONF") || return 1
+    printf '\n'
+    info '=== 当前端口转发规则 ==='
+    printf '\n'
+    if (( count == 0 )); then warn '暂无转发规则'; return; fi
+    print_rules
     printf '\n  共 %s%s%s 条转发规则。\n' "$GREEN" "$count" "$NC"
 }
 
 choose_rule() {
-    local n count
+    local action=${1:-选择} n count
     count=$(jq '.endpoints|length' "$CONF") || return 1
-    (( count )) || { fail '暂无转发规则。'; return 1; }
-    view_rules >&2
-    read -r -p '  请选择规则序号（0 或回车取消）：' n || return 1
+    printf '\n' >&2
+    info "=== ${action}端口转发规则 ===" >&2
+    printf '\n' >&2
+    (( count )) || { warn '暂无转发规则' >&2; return 1; }
+    print_rules >&2
+    printf '\n' >&2
+    read -r -p "  请输入要${action}的序号 (0 取消): " n || return 1
     [[ -n $n && $n != 0 ]] || return 1
-    [[ $n =~ ^[0-9]{1,6}$ ]] && (( 10#$n > 0 && 10#$n <= count )) || { fail '编号无效。'; return 1; }
+    [[ $n =~ ^[0-9]{1,6}$ ]] && (( 10#$n > 0 && 10#$n <= count )) || { fail '无效选择'; return 1; }
     printf '%d\n' "$((10#$n-1))"
 }
 
@@ -375,8 +396,15 @@ save_rule() {
     local status=$?
     rm -f "$temp"
     if (( status == 0 )); then
-        printf '  【%s】 %s → %s  [%s]\n' "$name" "$listen" "$remote" "${protocol^^}"
-        printf '  请放行 %s 端口 %s；NAT/容器还需映射对应协议的端口。\n' "${protocol^^}" "$port"
+        if (( index < 0 )); then
+            success '端口转发规则已添加并生效！'
+        else
+            success '转发规则已修改并生效！'
+        fi
+        printf '  引擎: %sRealm%s\n' "$GREEN" "$NC"
+        printf '  转发模式: %s%s%s\n' "$GREEN" "${protocol^^}" "$NC"
+        printf '  【%s】 本机端口: %s%s%s → 目标: %s%s%s\n' \
+            "$name" "$GREEN" "$port" "$NC" "$GREEN" "$remote" "$NC"
     fi
     return "$status"
 }
@@ -413,24 +441,35 @@ choose_protocol() {
 edit_rule() {
     local index=${1:--1} port='' host='' target='' protocol='' name='' value h
     if (( index >= 0 )); then
-        info '修改端口转发规则'
         value=$(jq -r --argjson i "$index" '.endpoints[$i].listen' "$CONF"); port=${value##*:}
         value=$(jq -r --argjson i "$index" '.endpoints[$i].remote' "$CONF"); target=${value##*:}; host=${value%:*}
         protocol=$(jq -r --argjson i "$index" "$JQ_PROTOCOL"' .network as $g | .endpoints[$i] | protocol($g)' "$CONF") || return 1
         name=$(jq -r --argjson i "$index" --arg fallback "转发规则-$port" '.endpoints[$i].name // $fallback' "$CONF") || return 1
-        printf '  当前规则: 【%s】 :%s → %s  [%s]\n\n' "$name" "$port" "$value" "${protocol^^}"
+        printf '\n  当前规则: 【%s】 本机 :%s%s%s → %s%s%s  [%s%s%s]\n\n' \
+            "$name" "$BLUE" "$port" "$NC" "$BLUE" "$value" "$NC" "$YELLOW" "${protocol^^}" "$NC"
         read -r -p "  新备注名称 (回车保持 $name): " value || return 1
         name=${value:-$name}
+        port=$(read_port '新本机监听端口' "$port") || return 1
     else
-        info '添加端口转发规则 · Realm'
+        printf '\n'
+        info '=== 添加端口转发规则 (引擎: Realm) ==='
+        printf '\n'
+        port=$(read_port '请输入本机监听端口') || return 1
     fi
-    port=$(read_port '请输入本机监听端口' "$port") || return 1
     while true; do
-        read -r -p "  请输入目标地址 (IP 或域名)${host:+ (回车保持 $host)}: " h || return 1
+        if (( index >= 0 )); then
+            read -r -p "  新目标地址 (回车保持 $host): " h || return 1
+        else
+            read -r -p '  请输入目标地址 (IP 或域名): ' h || return 1
+        fi
         h=${h:-$host}
         if remote_address "$h" 1 >/dev/null; then host=$h; break; fi
     done
-    target=$(read_port '请输入目标端口' "$target") || return 1
+    if (( index >= 0 )); then
+        target=$(read_port '新目标端口' "$target") || return 1
+    else
+        target=$(read_port '请输入目标端口') || return 1
+    fi
     protocol=$(choose_protocol "$protocol") || return 1
     if (( index < 0 )); then
         read -r -p "  请输入备注名称 (回车默认: 转发规则-$port): " name || return 1
@@ -439,21 +478,35 @@ edit_rule() {
 }
 
 delete_rules() {
-    local index=$1 temp answer
+    local index=$1 temp answer count selected_port status
     if (( index == -1 )); then
-        read -r -p '确认清空全部规则？[y/N] ' answer || return 1
+        count=$(jq '.endpoints|length' "$CONF") || return 1
+        if (( count == 0 )); then warn '暂无转发规则'; return 0; fi
+        printf '\n'
+        warn "确认清空全部 ${count} 条端口转发规则？"
+        read -r -p '  (y/N): ' answer || return 1
         [[ $answer == y || $answer == Y ]] || return 0
+    else
+        selected_port=$(jq -r --argjson i "$index" '.endpoints[$i].listen | split(":") | last' "$CONF") || return 1
     fi
     temp=$(mktemp "$DIR/.rules.XXXXXX") || return 1
     jq --argjson i "$index" 'if $i<0 then .endpoints=[] else del(.endpoints[$i]) end' "$CONF" > "$temp" && apply_rules "$temp"
-    local status=$?
+    status=$?
     rm -f "$temp"
+    if (( status == 0 )); then
+        if (( index == -1 )); then success '所有端口转发规则已清空';
+        else success "已删除端口 ${selected_port} 的转发规则"; fi
+    fi
     return "$status"
 }
 
 uninstall() {
     local answer
-    read -r -p '卸载将删除 Realm、全部规则和备份，确认？[y/N] ' answer || return 1
+    printf '\n'
+    info '=== 一键卸载 Realm ==='
+    printf '\n'
+    warn '卸载将删除 Realm、全部规则和备份，是否继续？'
+    read -r -p '  (y/N): ' answer || return 1
     [[ $answer == y || $answer == Y ]] || return 1
     check_service || return 1
     if svc active; then svc stop || { fail '停止服务失败，未删除文件。'; return 1; }; fi
@@ -469,6 +522,8 @@ uninstall() {
 
 menu() {
     local count choice index header_pad
+    MENU_INTERRUPTED=0
+    trap 'MENU_INTERRUPTED=1' INT
     while true; do
         [[ -t 1 ]] && printf '\033[2J\033[H'
         count=$(jq '.endpoints|length' "$CONF") || return 1
@@ -485,19 +540,25 @@ menu() {
         printf '  ║  %s[7]%s 一键卸载%25s║\n' "$RED" "$BLUE" ''
         printf '  ║  %s[0]%s 退出脚本%25s║\n' "$YELLOW" "$BLUE" ''
         printf '  ╚═══════════════════════════════════════╝%s\n\n' "$NC"
-        read -r -p '  请输入选项 [0-7]: ' choice || return 0
+        MENU_INTERRUPTED=0
+        if ! read -r -p '  请输入选项 [0-7]: ' choice; then
+            if (( MENU_INTERRUPTED )); then pause_menu; continue; fi
+            trap - INT
+            return 0
+        fi
+        MENU_INTERRUPTED=0
         case "$choice" in
             1) edit_rule || true ;;
             2) view_rules ;;
-            3) index=$(choose_rule) && edit_rule "$index" || true ;;
-            4) index=$(choose_rule) && delete_rules "$index" || true ;;
+            3) index=$(choose_rule '修改') && edit_rule "$index" || true ;;
+            4) index=$(choose_rule '删除') && delete_rules "$index" || true ;;
             5) delete_rules -1 || true ;;
-            6) update_realm || true ;;
-            7) uninstall && return 0 ;;
-            0) return 0 ;;
+            6) printf '\n'; info '=== 更新 Realm ==='; printf '\n'; update_realm || true ;;
+            7) if uninstall; then trap - INT; return 0; fi ;;
+            0) trap - INT; return 0 ;;
             *) fail '无效选项。' ;;
         esac
-        read -r -p '  按回车继续……' choice || return 0
+        if (( MENU_INTERRUPTED )); then pause_menu; else pause_enter; fi
     done
 }
 
