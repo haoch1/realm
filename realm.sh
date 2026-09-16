@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# 基于 jinqians/realm；菜单参考 0xdabiaoge/singbox-lite/advanced_relay.sh。
-# 单引擎、纯 TCP。首次添加时安装最新版；bash realm.sh --update 更新核心。
+# Realm TCP 转发管理。首次添加时安装最新版；rt --update 更新核心。
 
 DIR=/root/realm
 BIN=$DIR/realm
@@ -385,10 +384,11 @@ menu() {
 }
 
 main() {
+    local command=${0##*/}
     case "${1:-}" in
-        -h|--help) printf '用法：sudo bash realm.sh [--update]\n不带参数直接打开转发管理；--update 更新 Realm 到最新稳定版。\n'; return 0 ;;
+        -h|--help) printf '用法：%s [--update]\n不带参数直接打开转发管理；--update 更新 Realm 到最新稳定版。\n' "$command"; return 0 ;;
         ''|--update) ;;
-        *) fail '用法：sudo bash realm.sh [--update]'; return 1 ;;
+        *) fail "用法：$command [--update]"; return 1 ;;
     esac
     [[ $(uname -s) == Linux && $EUID == 0 ]] || {
         fail '请在 Linux VPS/容器中以 root 或 sudo 运行。'; return 1;

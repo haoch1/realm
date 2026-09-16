@@ -1,6 +1,26 @@
 # Realm TCP 转发管理
 
-基于 [jinqians/realm](https://github.com/jinqians/realm/blob/ca33b85a391dd1e854cb4780681cc894288a6ff6/realm.sh) 改造，菜单参考 [advanced_relay.sh](https://github.com/0xdabiaoge/singbox-lite/blob/main/advanced_relay.sh) 的端口转发部分。只保留 Realm 和 TCP；运行脚本直接显示：
+用于 Linux 服务器的 TCP 端口转发管理工具。通过 `rt` 统一管理转发规则，支持域名、IPv4 和 IPv6 目标，自动配置 systemd 或 OpenRC 服务。
+
+## 一键安装
+
+使用 **root** 执行：
+
+```sh
+sh -c 's=$(curl -fsSL "$1" 2>/dev/null || wget -qO- "$1") && exec sh -c "$s"' sh https://raw.githubusercontent.com/haoch1/realm-tcp/main/install.sh
+```
+
+安装入口兼容 POSIX `sh`，自动识别 `apt-get`、`apk`、`dnf` 或 `yum`，按需安装 Bash 和其他依赖。系统需具备 curl 或 wget 任一下载工具。
+
+安装完成后自动进入管理菜单。再次打开只需输入：
+
+```sh
+rt
+```
+
+普通用户使用 `sudo rt`。通过非交互方式安装时，不自动打开菜单。
+
+## 使用说明
 
 ```text
 [1] 添加转发规则
@@ -11,67 +31,83 @@
 [0] 退出脚本
 ```
 
-## 使用
+添加规则时依次填写本机监听端口、目标 IP/域名、目标端口。例如：
 
-把 `realm.sh` 上传到服务器，在所在目录以 root 运行：
+| 字段 | 示例 |
+| --- | --- |
+| 本机监听端口 | `10001` |
+| 目标 IP/域名 | `example.com` |
+| 目标端口 | `443` |
 
-```sh
-bash realm.sh
-```
+域名不需要填写 `https://` 或路径。新规则监听 `0.0.0.0`，编辑已有规则时保留原监听地址。端口范围为 `1–65535`；重复或已被其他进程占用的监听端口会被拒绝。
 
-Alpine 首次使用先安装 Bash：
+新增规则后启用服务及开机自启。删除最后一条规则或清空规则后停止服务并取消自启。修改规则会重启 Realm，已有 TCP 连接可能中断。
 
-```sh
-apk add --no-cache bash
-bash realm.sh
-```
+## 系统支持
 
-其余依赖由脚本自动安装。支持使用 systemd 的 Debian、Ubuntu、RHEL 系发行版，以及使用 OpenRC 的 Alpine。需要系统已有并运行相应的服务管理器；不支持只有 `/bin/sh` 作为 PID 1 的裸容器。使用 `sudo` 的系统可执行 `sudo bash realm.sh`。
+| 系统 | 包管理器 | 服务管理 |
+| --- | --- | --- |
+| Debian / Ubuntu | apt-get | systemd |
+| Alpine | apk | OpenRC |
+| RHEL 系，包括 Rocky Linux / AlmaLinux | dnf / yum | systemd |
 
-第一次添加规则时，自动从 [Realm 官方最新稳定版](https://github.com/zhboner/realm/releases/latest) 下载对应架构的 musl 程序并校验 SHA256。支持 x86_64、ARM64 和 ARMv7 硬浮点，不写死版本号。已有程序时打开菜单不检查更新，需要升级时执行：
+支持 `x86_64`、`ARM64`、`ARMv7` 硬浮点架构，使用 Realm 官方 musl 构建。运行环境需要已有并运行 systemd 或 OpenRC；LXC 中也需满足这一条件。
 
-```sh
-bash realm.sh --update
-```
+本工具仅管理 **TCP** 转发。服务器需能解析目标域名并连接目标端口；监听端口还需由系统防火墙和云安全组放行。
 
-升级保留规则和原服务运行状态；新版本启动或监听失败时尝试恢复旧程序。下载失败、架构不支持、发布包或校验信息不符合预期时停止更新。此机制适配当前官方发布格式，不保证未来破坏性配置变更仍兼容。
+## NAT / LXC 配置
 
-## Alpine、LXC 和 NAT VPS
+Realm 使用普通 TCP 连接，不需要 TUN、`NET_ADMIN` 或内核 IP 转发权限。NAT 环境的公网访问依赖宿主机或服务商提供的端口映射。
 
-Realm 使用普通 TCP 连接，不依赖容器的 `NET_ADMIN`、nftables、TUN 或 IP 转发权限。LXC 容器内以 root 运行，具备 systemd 或 OpenRC、可写文件系统、可用监听端口和到目标的网络连接即可。脚本不会修改防火墙、宿主机 NAT 或内核参数。
-
-例如服务商提供：
+例如已有映射：
 
 ```text
 公网地址:30001 → 容器内网地址:10001
 ```
 
-在脚本中填写监听端口 **10001**，再填写目标 IP/域名和目标端口；客户端连接 **公网地址:30001**。如果服务商分配的是端口范围，只能使用范围内对应的端口。没有上游映射的端口，脚本无法自行开放到公网。
+在 `rt` 中填写监听端口 **10001**，客户端连接 **公网地址:30001**。公网端口和容器端口可以不同；没有上游映射的端口无法通过脚本直接暴露到公网。
 
-新规则监听 `0.0.0.0`，可转发到 IPv4、域名或 IPv6 目标。编辑旧规则保留原监听地址。容器无法访问的目标，或被系统防火墙、云安全组拦截的端口，仍需先解决网络连通性。
+## 更新
 
-## 配置与服务
+首次添加规则时自动获取 Realm 最新稳定版，并按架构选择安装包、校验 SHA256。更新 Realm 核心：
 
-- 程序：`/root/realm/realm`；规则：`/root/realm/config.json`，直接使用 Realm 原生配置。
-- 自动导入原脚本的简单 `/root/realm/config.toml`，保留原文件。含未知自定义选项的旧配置会提示手动处理，避免丢失设置。
-- 规则修改及核心升级保留最近一次 `.bak` 备份。修改规则会重启服务，已有 TCP 连接可能中断。
-- systemd：`systemctl status realm`；日志：`journalctl -u realm -n 50`。
-- OpenRC：`rc-service realm status`；日志：`/var/log/realm.log`。
-- 添加规则后启用开机自启；清空或删除最后一条规则后停止服务并取消自启。
+```sh
+rt --update
+```
 
-## 验证
+更新管理脚本时，重新执行一键安装命令即可。两种更新均保留已有转发规则。
 
-`tests/test.sh` 在独立目录内验证配置迁移、规则增删改、端口冲突、升级及失败回滚，服务和监听查询使用替身，不会操作本机服务。可分别执行：
+核心升级会保留原服务运行状态；下载、校验或启动检查失败时停止更新，必要时恢复原程序。更新依赖官方当前的发布格式与配置兼容性。
+
+## 文件与服务
+
+| 路径 | 用途 |
+| --- | --- |
+| `/usr/local/bin/rt` | 管理命令 |
+| `/root/realm/realm` | Realm 核心程序 |
+| `/root/realm/config.json` | 转发规则 |
+| `/root/realm/realm.bak` | 上一次升级前的核心程序 |
+| `/root/realm/config.json.bak` | 上一次修改前的转发规则 |
+
+支持导入简单的 `/root/realm/config.toml` 配置，保留原文件。遇到不支持的自定义字段时停止导入，提示手动处理。
+
+| 操作 | systemd | OpenRC |
+| --- | --- | --- |
+| 查看状态 | `systemctl status realm` | `rc-service realm status` |
+| 查看日志 | `journalctl -u realm -n 50 --no-pager` | `tail -n 50 /var/log/realm.log` |
+| 重启服务 | `systemctl restart realm` | `rc-service realm restart` |
+
+## 开发验证
+
+测试需要 Bash、Node.js、jq、tar 和 coreutils；Node.js 仅用于开发测试。
 
 ```sh
 node tests/setup.mjs
+sh -n install.sh
 bash -n realm.sh
+bash tests/install.test.sh
 bash tests/test.sh systemd
 bash tests/test.sh openrc
 ```
 
-Linux 测试环境需预装 Bash、jq、tar 和 coreutils；Windows 开发验证使用 Git Bash、Node.js 和自动下载的官方 jq。Windows 测试不覆盖 Linux 权限、真实 init 系统、容器限制和上游 NAT 映射。
-
-2026-09-16 验证结果：Bash 语法检查通过；systemd 与 OpenRC 各 21 项行为检查通过。已使用官方 v2.9.6 发布元数据验证架构和安装包选择；尚未在真实 Alpine/LXC 上部署验证。
-
-实际部署只需 `realm.sh`，项目来源见本文开头的链接。
+测试覆盖安装入口、配置迁移、规则增删改、端口冲突、升级和失败回滚。包管理器和服务操作使用替身，测试不会安装软件或修改本机服务；真实 Alpine/LXC 环境的部署与公网连通性需另行验证。
