@@ -10,7 +10,7 @@
 (curl -LfsS https://raw.githubusercontent.com/haoch1/realm/main/realm.sh -o /usr/local/bin/r || wget -q https://raw.githubusercontent.com/haoch1/realm/main/realm.sh -O /usr/local/bin/r) && chmod +x /usr/local/bin/r && r
 ```
 
-自动识别系统并安装依赖，完成后直接进入菜单。Alpine 无需提前安装 Bash；首次下载需要系统已有 curl 或 wget。
+自动识别系统，安装依赖与 Realm 最新稳定版核心，完成后进入菜单。Alpine 无需提前安装 Bash；首次下载需要系统已有 curl 或 wget。添加第一条规则后启动转发服务。
 
 以后直接运行：
 
@@ -59,7 +59,7 @@ r
 
 ## 更新
 
-首次添加规则时自动安装 Realm 最新稳定版，并校验 SHA256。以后在菜单选择 **[6] 更新 Realm**，也可直接执行：
+首次启动时自动安装 Realm 最新稳定版，并校验 SHA256 和程序实际版本。以后在菜单选择 **[6] 更新 Realm**，也可直接执行：
 
 ```sh
 r --update

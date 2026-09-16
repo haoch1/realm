@@ -1,5 +1,5 @@
 #!/bin/sh
-# Realm 端口转发管理。首次添加时安装最新版；r --update 更新核心。
+# Realm 端口转发管理。首次启动时安装最新版；r --update 更新核心。
 
 # POSIX 启动段：Alpine 没有 Bash 时先安装，再交给 Bash 运行。
 install_packages() {
@@ -49,7 +49,16 @@ fail() { printf '  %s[错误] %s%s\n' "$RED" "$*" "$NC" >&2; return 1; }
 info() { printf '\n  %s=== %s ===%s\n\n' "$BLUE" "$*" "$NC"; }
 success() { printf '  %s[成功] %s%s\n' "$GREEN" "$*" "$NC"; }
 get() { curl -fLsS --retry 2 --connect-timeout 15 --max-time 180 --proto '=https' --proto-redir '=https' "$1" -o "$2"; }
-version() { timeout 10 "$1" -v 2>/dev/null | awk 'NR==1 {sub(/^v/, "", $NF); print $NF}'; }
+version() {
+    local output
+    output=$(timeout 10 "$1" --version 2>&1) || { printf '%s\n' "$output" >&2; return 1; }
+    if [[ $output =~ ^[Rr]ealm[[:space:]]+v?([0-9]+\.[0-9]+\.[0-9]+)([[:space:]]|$) ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+    else
+        printf '无法识别版本输出：%s\n' "$output" >&2
+        return 1
+    fi
+}
 
 dependencies() {
     local cmd missing=0
@@ -215,7 +224,7 @@ update_realm() (
     get "$API" "$temp/release.json" && select_asset "$temp/release.json" "$(uname -m)" || {
         fail '获取最新版本失败，请检查 GitHub 访问或 API 限流。'; exit 1;
     }
-    current=$(version "$BIN") || current=''
+    current=$(version "$BIN" 2>/dev/null) || current=''
     [[ $current != "${TAG#v}" ]] || { printf '已是最新版 %s。\n' "$TAG"; exit 0; }
     get "$URL" "$temp/package.tar.gz" || exit 1
     sum=$(sha256sum "$temp/package.tar.gz") || exit 1
@@ -224,7 +233,12 @@ update_realm() (
     member=$(awk '/(^|\/)realm$/ {print}' "$temp/files")
     [[ -n $member && $member != *$'\n'* && $member != /* && $member != *'..'* ]] || exit 1
     tar -xOzf "$temp/package.tar.gz" -- "$member" > "$temp/realm" && chmod 755 "$temp/realm" || exit 1
-    [[ $(version "$temp/realm") == "${TAG#v}" ]] || { fail '新版程序不能运行或版本不匹配。'; exit 1; }
+    current=$(version "$temp/realm" 2> "$temp/version.error") || {
+        fail "新版程序无法执行或无法读取版本（架构：$(uname -m)）。"
+        cat "$temp/version.error" >&2
+        exit 1
+    }
+    [[ $current == "${TAG#v}" ]] || { fail "版本不匹配：期望 ${TAG#v}，实际 $current。"; exit 1; }
     if [[ -f $BIN ]]; then cp -p "$BIN" "$temp/old" && cp -p "$BIN" "$BIN.bak" || exit 1; had=1; fi
     if svc active; then active=1; fi
     replaced=1
@@ -275,7 +289,7 @@ apply_rules() (
     trap 'exit 130' INT
     trap 'exit 143' TERM HUP
     count=$(jq -er '.endpoints | length' "$candidate") || exit 1
-    if (( count )) && { [[ ! -x $BIN ]] || ! version "$BIN" >/dev/null; }; then update_realm || exit 1; fi
+    if (( count )) && { [[ ! -x $BIN ]] || ! version "$BIN" >/dev/null 2>&1; }; then update_realm || exit 1; fi
     cp -p "$CONF" "$temp/config" && cp -p "$CONF" "$CONF.bak" || exit 1
     if [[ -f $UNIT ]]; then cp -p "$UNIT" "$temp/unit" || exit 1; had_unit=1; fi
     if svc active; then active=1; fi
@@ -450,12 +464,13 @@ menu() {
     while true; do
         [[ -t 1 ]] && printf '\033[2J\033[H'
         count=$(jq '.endpoints|length' "$CONF") || return 1
-        current=$(version "$BIN") || current='未安装'
+        current=$(version "$BIN" 2>/dev/null) || current='未安装'
         printf '\n%s  ╔══════════════════════════════════════════════╗\n' "$BLUE"
         printf '  ║  端口转发管理 · Realm                       ║\n'
         printf '  ╚══════════════════════════════════════════════╝%s\n' "$NC"
         printf '     当前规则：%s%s%s 条\n\n' "$GREEN" "$count" "$NC"
-        state='未运行'; if svc active; then state='运行中'; fi
+        state='未运行'; (( count )) || state='待添加规则'
+        if svc active; then state='运行中'; fi
         printf '     Realm：%s  |  状态：%s\n\n' "${current:-未安装}" "$state"
         printf '     [1] 添加转发规则\n     [2] 查看当前转发规则\n     [3] 修改转发规则\n     [4] 删除转发规则\n'
         printf '     %s[5] 清空所有转发规则%s\n     [6] 更新 Realm\n     %s[7] 一键卸载%s\n     [0] 退出脚本\n\n' "$RED" "$NC" "$RED" "$NC"
@@ -493,7 +508,12 @@ main() {
     check_service || return 1
     if [[ ${1:-} == --uninstall ]]; then uninstall; return; fi
     mkdir -p "$DIR" && init_config || return 1
-    if [[ ${1:-} == --update ]]; then update_realm; else menu; fi
+    if [[ ${1:-} == --update ]]; then
+        update_realm
+    else
+        if ! version "$BIN" >/dev/null 2>&1; then update_realm || return 1; fi
+        menu
+    fi
 }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
