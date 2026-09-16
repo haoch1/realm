@@ -9,10 +9,10 @@
 使用 `root` 执行：
 
 ```sh
-(t=$(mktemp) && trap 'rm -f "$t"' EXIT && u="https://raw.githubusercontent.com/haoch1/realm/main/realm.sh?v=$(date +%s)" && (curl -LfsS "$u" -o "$t" || wget -q "$u" -O "$t") && sh "$t" --install)
+(curl -LfsS https://raw.githubusercontent.com/haoch1/realm/main/realm.sh -o /usr/local/bin/r || wget -q https://raw.githubusercontent.com/haoch1/realm/main/realm.sh -O /usr/local/bin/r) && chmod +x /usr/local/bin/r && r
 ```
 
-首次下载需已有 curl 或 wget。安装命令先下载到临时文件，脚本自动识别包管理器、补齐依赖并安装 `r` 命令；Alpine 不需要提前安装 Bash。管理脚本通过语法检查后原子替换，下载失败不会覆盖已有命令。
+首次下载需已有 curl 或 wget。命令将脚本下载到 `/usr/local/bin/r`，赋予执行权限并打开菜单。脚本自动识别包管理器、补齐依赖；Alpine 不需要提前安装 Bash。
 
 首次运行自动获取 Realm 官方最新稳定版，根据架构选择安装包，校验 SHA256 摘要及程序实际版本。添加第一条规则后启动转发服务。
 
