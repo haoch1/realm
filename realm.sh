@@ -51,15 +51,21 @@ fail() { printf '  %s[错误] %s%s\n' "$RED" "$*" "$NC" >&2; return 1; }
 info() { printf '  %s[信息] %s%s\n' "$BLUE" "$*" "$NC"; }
 warn() { printf '  %s[注意] %s%s\n' "$YELLOW" "$*" "$NC"; }
 success() { printf '  %s[成功] %s%s\n' "$GREEN" "$*" "$NC"; }
+read_input() {
+    local destination=$1 prompt=$2 reply='' status=0
+    read -r -p "$prompt" reply || status=$?
+    if (( ${MENU_INTERRUPTED:-0} || status == 130 )) ||
+        [[ $reply == [qQ] || $reply == '^C' || $reply == *$'\003'* ]]; then
+        MENU_INTERRUPTED=1
+        return 130
+    fi
+    (( status == 0 )) || return "$status"
+    printf -v "$destination" '%s' "$reply"
+}
 pause_enter() { read -r -p '  按回车继续...' _ || true; }
 pause_menu() {
     printf '\n'
-    if [[ -t 0 ]]; then
-        read -r -s -n 1 -p '  按任意键返回主菜单...' _ || true
-        printf '\n'
-    else
-        read -r -p '  按任意键返回主菜单...' _ || true
-    fi
+    read -r -p '  按回车返回主菜单...' _ || true
 }
 get() { curl -fLsS --retry 2 --connect-timeout 15 --max-time 180 --proto '=https' --proto-redir '=https' "$1" -o "$2"; } 9>&-
 version() {
@@ -529,7 +535,7 @@ choose_rule() {
     (( count )) || { warn '暂无转发规则' >&2; return 1; }
     print_rules >&2
     printf '\n' >&2
-    read -r -p "  请输入要${action}的序号 (0 取消): " n || return 1
+    read_input n "  请输入要${action}的序号 (0 取消): " || return 1
     [[ -n $n && $n != 0 ]] || return 1
     [[ $n =~ ^[0-9]{1,6}$ ]] && (( 10#$n > 0 && 10#$n <= count )) || { fail '无效选择'; return 1; }
     printf -v "$result" '%d' "$((10#$n-1))"
@@ -590,7 +596,7 @@ save_rule() {
 read_port() {
     local result=$1 label=$2 previous=${3:-} input
     while true; do
-        read -r -p "  ${label}${previous:+ (回车保持 $previous)}: " input || return 1
+        read_input input "  ${label}${previous:+ (回车保持 $previous)}: " || return 1
         input=${input:-$previous}
         if valid_port "$input"; then printf -v "$result" '%d' "$((10#$input))"; return; fi
         fail '无效端口，请输入 1–65535 之间的数字。'
@@ -603,8 +609,8 @@ choose_protocol() {
     printf '    %s[1]%s 仅 TCP\n    %s[2]%s 仅 UDP\n    %s[3]%s TCP+UDP\n' "$GREEN" "$NC" "$GREEN" "$NC" "$GREEN" "$NC" >&2
     if [[ -n $current ]]; then printf '    %s[0]%s 保持 %s\n' "$GREEN" "$NC" "${current^^}" >&2; fi
     while true; do
-        if [[ -n $current ]]; then read -r -p '  请选择 [0-3] (回车不改): ' choice || return 1
-        else read -r -p '  请选择 [1-3] (默认 1): ' choice || return 1; fi
+        if [[ -n $current ]]; then read_input choice '  请选择 [0-3] (回车不改): ' || return 1
+        else read_input choice '  请选择 [1-3] (默认 1): ' || return 1; fi
         case "$choice" in
             '') selected=${current:-tcp} ;;
             0) selected=$current ;;
@@ -627,20 +633,21 @@ edit_rule() {
         name=$(jq -r --argjson i "$index" --arg fallback "转发规则-$port" '.endpoints[$i].name // $fallback' "$CONF") || return 1
         printf '\n  当前规则: 【%s】 本机 :%s%s%s → %s%s%s  [%s%s%s]\n\n' \
             "$name" "$BLUE" "$port" "$NC" "$BLUE" "$value" "$NC" "$YELLOW" "${protocol^^}" "$NC"
-        read -r -p "  新备注名称 (回车保持 $name): " value || return 1
+        printf '  输入 q 或按 Ctrl+C 取消，按回车保留原值。\n\n'
+        read_input value "  新备注名称 (回车保持 $name): " || return 1
         name=${value:-$name}
         read_port port '新本机监听端口' "$port" || return 1
     else
         printf '\n'
         info '=== 添加端口转发规则 ==='
-        printf '\n'
+        printf '\n  输入 q 或按 Ctrl+C 取消。\n\n'
         read_port port '请输入本机监听端口' || return 1
     fi
     while true; do
         if (( index >= 0 )); then
-            read -r -p "  新目标地址 (回车保持 $host): " h || return 1
+            read_input h "  新目标地址 (回车保持 $host): " || return 1
         else
-            read -r -p '  请输入目标地址 (IP 或域名): ' h || return 1
+            read_input h '  请输入目标地址 (IP 或域名): ' || return 1
         fi
         h=${h:-$host}
         if remote_address "$h" 1 >/dev/null; then host=$h; break; fi
@@ -652,7 +659,7 @@ edit_rule() {
     fi
     choose_protocol protocol "$protocol" || return 1
     if (( index < 0 )); then
-        read -r -p "  请输入备注名称 (回车默认: 转发规则-$port): " name || return 1
+        read_input name "  请输入备注名称 (回车默认: 转发规则-$port): " || return 1
     fi
     save_rule "$index" "$port" "$host" "$target" "$protocol" "$name"
 }
@@ -664,7 +671,7 @@ delete_rules() {
         if (( count == 0 )); then warn '暂无转发规则'; return 0; fi
         printf '\n'
         warn "确认清空全部 ${count} 条端口转发规则？"
-        read -r -p '  (y/N): ' answer || return 1
+        read_input answer '  (y/N): ' || return 1
         [[ $answer == y || $answer == Y ]] || return 0
     else
         selected_port=$(jq -r --argjson i "$index" '.endpoints[$i].listen | split(":") | last' "$CONF") || return 1
@@ -686,7 +693,7 @@ uninstall() {
     info '=== 一键卸载 Realm ==='
     printf '\n'
     warn '卸载将删除 Realm、全部规则和备份，是否继续？'
-    read -r -p '  (y/N): ' answer || return 1
+    read_input answer '  (y/N): ' || return 1
     [[ $answer == y || $answer == Y ]] || return 1
     check_service || return 1
     if [[ -f $UNIT ]] || svc active; then svc stop >/dev/null 2>&1 || { fail '停止服务失败，未删除文件。'; return 1; }; fi
