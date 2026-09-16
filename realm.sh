@@ -29,7 +29,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
 fi
 
 DIR=/root/realm
-SCRIPT_VERSION=1.0.0
+SCRIPT_VERSION=1.0.1
 BIN=$DIR/realm
 CONF=$DIR/config.json
 UNIT=/etc/systemd/system/realm.service
@@ -321,7 +321,7 @@ update_realm() (
         fail '获取最新版本失败，请检查 GitHub 访问或 API 限流。'; exit 1;
     }
     current=$(version "$BIN" 2>/dev/null) || current=''
-    [[ $current != "${TAG#v}" ]] || { printf '  已是最新版 %s。\n' "$TAG"; exit 0; }
+    [[ $current != "${TAG#v}" ]] || { printf '  已是最新版 %s\n' "$TAG"; exit 0; }
     get "$URL" "$temp/package.tar.gz" || exit 1
     sum=$(sha256sum "$temp/package.tar.gz") || exit 1
     [[ ${sum%% *} == "${HASH#sha256:}" ]] || { fail 'SHA256 校验失败。'; exit 1; }
@@ -341,7 +341,7 @@ update_realm() (
     mv -f "$temp/realm" "$BIN" || exit 1
     if (( active )); then svc restart && ready || exit 1; fi
     replaced=0
-    printf '  Realm 已更新至 %s。\n' "$TAG"
+    printf '  Realm 已更新至 %s\n' "$TAG"
 )
 
 update_script() (
@@ -710,7 +710,7 @@ menu() {
         header_pad=$((7-${#count})); (( header_pad > 0 )) || header_pad=1
         printf '\n%s  ╔═══════════════════════════════════════╗\n' "$BLUE"
         printf '  ║    端口转发管理 (当前规则: %s%s%s 条)%*s║\n' "$GREEN" "$count" "$BLUE" "$header_pad" ''
-        printf '  ║  管理脚本: %sv%s%s%*s║\n' "$GREEN" "$SCRIPT_VERSION" "$BLUE" "$((26-${#SCRIPT_VERSION}))" ''
+        printf '  ║    管理脚本: %sv%s%s%*s║\n' "$GREEN" "$SCRIPT_VERSION" "$BLUE" "$((24-${#SCRIPT_VERSION}))" ''
         printf '  ╠═══════════════════════════════════════╣\n'
         printf '  ║  %s[1]%s 添加转发规则%21s║\n' "$GREEN" "$BLUE" ''
         printf '  ║  %s[2]%s 查看当前转发规则%17s║\n' "$GREEN" "$BLUE" ''
