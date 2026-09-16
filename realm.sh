@@ -4,13 +4,13 @@
 # POSIX 启动段：Alpine 没有 Bash 时先安装，再交给 Bash 运行。
 install_packages() {
     if command -v apk >/dev/null 2>&1; then
-        apk add --no-cache bash ca-certificates curl jq tar coreutils flock iproute2-ss procps
+        apk add --no-cache bash ca-certificates curl jq tar coreutils flock iproute2-ss procps musl-utils
     elif command -v apt-get >/dev/null 2>&1; then
-        apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y bash ca-certificates curl jq tar coreutils util-linux iproute2 procps
+        apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y bash ca-certificates curl jq tar coreutils util-linux iproute2 procps libc-bin
     elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y bash ca-certificates curl jq tar coreutils util-linux iproute procps-ng
+        dnf install -y bash ca-certificates curl jq tar coreutils util-linux iproute procps-ng glibc-common
     elif command -v yum >/dev/null 2>&1; then
-        yum install -y bash ca-certificates curl jq tar coreutils util-linux iproute procps-ng
+        yum install -y bash ca-certificates curl jq tar coreutils util-linux iproute procps-ng glibc-common
     else
         printf '无法识别包管理器，需要 apt-get、apk、dnf 或 yum。\n' >&2
         return 1
@@ -29,7 +29,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
 fi
 
 DIR=/root/realm
-SCRIPT_VERSION=1.0.4
+SCRIPT_VERSION=1.0.5
 BIN=$DIR/realm
 CONF=$DIR/config.json
 UNIT=/etc/systemd/system/realm.service
@@ -81,7 +81,7 @@ version() {
 
 dependencies() {
     local cmd missing=0
-    local -a required=(curl jq tar sha256sum timeout flock ss pgrep)
+    local -a required=(curl jq tar sha256sum timeout flock ss pgrep getent)
     for cmd in "${required[@]}"; do command -v "$cmd" >/dev/null || missing=1; done
     (( missing )) || return 0
     install_packages || return 1
@@ -447,6 +447,25 @@ remote_address() {
     fi
 }
 
+show_resolution() {
+    local host=$1 output address resolved='' family=''
+    [[ $host != *:* ]] && ! valid_ipv4 "$host" || return 0
+    output=$(timeout 5 getent ahosts "$host" 9>&- 2>/dev/null) || output=''
+    (( ${MENU_INTERRUPTED:-0} )) && return 130
+    while read -r address _; do
+        if valid_ipv4 "$address"; then
+            resolved=$address; family=ipv4; break
+        elif [[ -z $resolved ]] && valid_ipv6 "$address"; then
+            resolved=$address; family=ipv6
+        fi
+    done <<< "$output"
+    if [[ -n $resolved ]]; then
+        success "域名已解析: $host -> $resolved ($family)"
+    else
+        warn "域名解析失败: $host，暂未获取到可用的 IP，可继续保存。"
+    fi
+}
+
 apply_rules() (
     local candidate=$1 temp active=0 had_unit=0 changed=0 enabled=0 status count
     temp=$(mktemp -d "$DIR/.change.XXXXXX") || exit 1
@@ -647,6 +666,7 @@ edit_rule() {
         h=${h:-$host}
         if remote_address "$h" 1 >/dev/null; then host=$h; break; fi
     done
+    show_resolution "$host" || return 1
     read_port target "$target_label" "$target" || return 1
     choose_protocol protocol "$protocol" || return 1
     if (( index < 0 )); then
