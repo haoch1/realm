@@ -336,7 +336,7 @@ update_script() (
     trap 'exit 130' INT
     trap 'exit 143' TERM HUP
     printf '  正在获取最新管理脚本...\n'
-    get "$SCRIPT_URL" "$temp" || { fail '管理脚本下载失败，请检查 GitHub 连接。'; exit 1; }
+    get "${SCRIPT_URL}?v=$$-$RANDOM" "$temp" || { fail '管理脚本下载失败，请检查 GitHub 连接。'; exit 1; }
     IFS= read -r first_line < "$temp" || true
     [[ $first_line == '#!/bin/sh' ]] || { fail '下载内容不是有效的管理脚本。'; exit 1; }
     bash -n "$temp" || { fail '新版管理脚本语法检查失败，未替换当前版本。'; exit 1; }
@@ -350,8 +350,16 @@ update_script() (
     fi
     chmod 755 "$temp" && mv -f "$temp" "$RT" || { fail '管理脚本替换失败。'; exit 1; }
     trap - EXIT INT TERM HUP
-    success '管理脚本已更新，重新运行 r 即可使用。'
+    success '管理脚本已更新。'
+    exit 10
 )
+
+reload_script() {
+    trap - INT TERM HUP
+    exec 9>&-
+    exec bash "$RT"
+    fail '无法重新加载管理脚本，请重新运行 r。'
+}
 
 valid_port() { [[ $1 =~ ^[0-9]{1,5}$ ]] && (( 10#$1 > 0 && 10#$1 < 65536 )); }
 
@@ -615,7 +623,7 @@ uninstall() {
 }
 
 menu() {
-    local count choice index header_pad
+    local count choice index header_pad status
     MENU_INTERRUPTED=0
     trap 'MENU_INTERRUPTED=1' INT
     while true; do
@@ -649,7 +657,11 @@ menu() {
             4) index=$(choose_rule '删除') && delete_rules "$index" || true ;;
             5) delete_rules -1 || true ;;
             6) printf '\n'; info '=== 更新 Realm ==='; printf '\n'; update_realm || true ;;
-            7) printf '\n'; info '=== 更新管理脚本 ==='; printf '\n'; update_script || true ;;
+            7)
+                printf '\n'; info '=== 更新管理脚本 ==='; printf '\n'
+                if update_script; then status=0; else status=$?; fi
+                if (( status == 10 )); then pause_enter; reload_script; return; fi
+                ;;
             8) if uninstall; then trap - INT; return 0; fi ;;
             0) trap - INT; return 0 ;;
             *) fail '无效选项。' ;;
@@ -659,7 +671,7 @@ menu() {
 }
 
 main() {
-    local command=${0##*/}
+    local command=${0##*/} status
     case "${1:-}" in
         -h|--help) printf '用法：%s [--update|--update-script|--uninstall]\n不带参数打开管理菜单；--update 更新 Realm；--update-script 更新管理脚本；--uninstall 卸载并清理全部规则。\n' "$command"; return 0 ;;
         ''|--update|--update-script|--uninstall) ;;
@@ -673,7 +685,10 @@ main() {
     mkdir -p /run/lock || return 1
     acquire_lock || return 1
     trap 'exit 0' TERM HUP
-    if [[ ${1:-} == --update-script ]]; then update_script; return; fi
+    if [[ ${1:-} == --update-script ]]; then
+        if update_script; then status=0; else status=$?; fi
+        if (( status == 10 )); then reload_script; else return "$status"; fi
+    fi
     check_service || return 1
     if [[ ${1:-} == --uninstall ]]; then uninstall; return; fi
     mkdir -p "$DIR" && init_config || return 1
