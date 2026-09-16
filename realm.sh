@@ -1,5 +1,32 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Realm TCP 转发管理。首次添加时安装最新版；rt --update 更新核心。
+
+# POSIX 启动段：Alpine 没有 Bash 时先安装，再交给 Bash 运行。
+install_packages() {
+    if command -v apk >/dev/null 2>&1; then
+        apk add --no-cache bash ca-certificates curl jq tar coreutils flock iproute2-ss procps
+    elif command -v apt-get >/dev/null 2>&1; then
+        apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y bash ca-certificates curl jq tar coreutils util-linux iproute2 procps
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y bash ca-certificates curl jq tar coreutils util-linux iproute procps-ng
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y bash ca-certificates curl jq tar coreutils util-linux iproute procps-ng
+    else
+        printf '无法识别包管理器，需要 apt-get、apk、dnf 或 yum。\n' >&2
+        return 1
+    fi
+}
+
+if [ -z "${BASH_VERSION:-}" ]; then
+    if ! command -v bash >/dev/null 2>&1; then
+        [ "$(uname -s)" = Linux ] && [ "$(id -u)" = 0 ] || {
+            printf '请在 Linux 服务器上以 root 运行。\n' >&2
+            exit 1
+        }
+        install_packages || exit 1
+    fi
+    exec bash "$0" "$@"
+fi
 
 DIR=/root/realm
 BIN=$DIR/realm
@@ -7,6 +34,9 @@ CONF=$DIR/config.json
 UNIT=/etc/systemd/system/realm.service
 INIT=systemd
 RUNLEVEL=/etc/runlevels/default
+RT=/usr/local/bin/rt
+LOG=/var/log/realm.log
+LOCK=/run/lock/realm-manager.lock
 API=https://api.github.com/repos/zhboner/realm/releases/latest
 BLUE=$'\033[1;34m' GREEN=$'\033[0;32m' RED=$'\033[0;31m' NC=$'\033[0m'
 
@@ -18,17 +48,7 @@ dependencies() {
     local cmd missing=0
     for cmd in curl jq tar sha256sum timeout flock ss pgrep; do command -v "$cmd" >/dev/null || missing=1; done
     (( missing )) || return 0
-    if command -v apk >/dev/null; then
-        apk add --no-cache ca-certificates curl jq tar coreutils flock iproute2-ss procps
-    elif command -v apt-get >/dev/null; then
-        apt-get update && apt-get install -y ca-certificates curl jq tar coreutils util-linux iproute2 procps
-    elif command -v dnf >/dev/null; then
-        dnf install -y ca-certificates curl jq tar coreutils util-linux iproute procps-ng
-    elif command -v yum >/dev/null; then
-        yum install -y ca-certificates curl jq tar coreutils util-linux iproute procps-ng
-    else
-        fail '请先安装 curl、jq、tar、coreutils、util-linux、iproute2 和 procps。'; return 1
-    fi || return 1
+    install_packages || return 1
     for cmd in curl jq tar sha256sum timeout flock ss pgrep; do command -v "$cmd" >/dev/null || return 1; done
 }
 
@@ -90,8 +110,8 @@ command_args="-c $CONF"
 supervisor="supervise-daemon"
 respawn_delay=5
 respawn_max=0
-output_log="/var/log/realm.log"
-error_log="/var/log/realm.log"
+output_log="$LOG"
+error_log="$LOG"
 depend() {
     use net
 }
@@ -358,6 +378,22 @@ delete_rules() {
     return "$status"
 }
 
+uninstall() {
+    local answer
+    read -r -p '卸载将删除 Realm、全部规则和备份，确认？[y/N] ' answer || return 1
+    [[ $answer == y || $answer == Y ]] || return 1
+    check_service || return 1
+    if svc active; then svc stop || { fail '停止服务失败，未删除文件。'; return 1; }; fi
+    if svc enabled 2>/dev/null; then svc disable || { fail '取消自启失败，未删除文件。'; return 1; }; fi
+    if svc active; then fail '服务仍在运行，未删除文件。'; return 1; fi
+    svc reset >/dev/null 2>&1 || true
+    rm -f -- "$UNIT" "$UNIT.bak" || return 1
+    svc reload || return 1
+    rm -rf -- "$DIR" || return 1
+    rm -f -- "$LOG" "$LOG".* "$RT" "$LOCK" || return 1
+    printf '卸载完成：服务、核心、规则、备份、独立日志和 rt 命令已清理。\n'
+}
+
 menu() {
     local count choice index
     while true; do
@@ -368,14 +404,16 @@ menu() {
         printf '  ╚══════════════════════════════════════════════╝%s\n' "$NC"
         printf '     当前规则：%s%s%s 条\n\n' "$GREEN" "$count" "$NC"
         printf '     [1] 添加转发规则\n     [2] 查看当前转发规则\n     [3] 修改转发规则\n     [4] 删除转发规则\n'
-        printf '     %s[5] 清空所有转发规则%s\n     [0] 退出脚本\n\n' "$RED" "$NC"
-        read -r -p '请输入选项 [0-5]：' choice || return 0
+        printf '     %s[5] 清空所有转发规则%s\n     [6] 更新 Realm\n     %s[7] 一键卸载%s\n     [0] 退出脚本\n\n' "$RED" "$NC" "$RED" "$NC"
+        read -r -p '请输入选项 [0-7]：' choice || return 0
         case "$choice" in
             1) edit_rule || true ;;
             2) view_rules ;;
             3) index=$(choose_rule) && edit_rule "$index" || true ;;
             4) index=$(choose_rule) && delete_rules "$index" || true ;;
             5) delete_rules -1 || true ;;
+            6) update_realm || true ;;
+            7) uninstall && return 0 ;;
             0) return 0 ;;
             *) fail '无效选项。' ;;
         esac
@@ -386,9 +424,9 @@ menu() {
 main() {
     local command=${0##*/}
     case "${1:-}" in
-        -h|--help) printf '用法：%s [--update]\n不带参数直接打开转发管理；--update 更新 Realm 到最新稳定版。\n' "$command"; return 0 ;;
-        ''|--update) ;;
-        *) fail "用法：$command [--update]"; return 1 ;;
+        -h|--help) printf '用法：%s [--update|--uninstall]\n不带参数打开管理菜单；--update 更新 Realm；--uninstall 卸载并清理全部规则。\n' "$command"; return 0 ;;
+        ''|--update|--uninstall) ;;
+        *) fail "用法：$command [--update|--uninstall]"; return 1 ;;
     esac
     [[ $(uname -s) == Linux && $EUID == 0 ]] || {
         fail '请在 Linux VPS/容器中以 root 或 sudo 运行。'; return 1;
@@ -396,9 +434,11 @@ main() {
     umask 077
     detect_init && dependencies || return 1
     mkdir -p /run/lock || return 1
-    exec 9>/run/lock/realm-manager.lock || return 1
+    exec 9>"$LOCK" || return 1
     flock -n 9 || { fail '另一个管理脚本正在运行。'; return 1; }
-    check_service && mkdir -p "$DIR" && init_config || return 1
+    check_service || return 1
+    if [[ ${1:-} == --uninstall ]]; then uninstall; return; fi
+    mkdir -p "$DIR" && init_config || return 1
     if [[ ${1:-} == --update ]]; then update_realm; else menu; fi
 }
 
