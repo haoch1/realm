@@ -1,5 +1,5 @@
 #!/bin/sh
-# Realm 端口转发管理。首次添加时安装最新版；realm --update 更新核心。
+# Realm 端口转发管理。首次添加时安装最新版；r --update 更新核心。
 
 # POSIX 启动段：Alpine 没有 Bash 时先安装，再交给 Bash 运行。
 install_packages() {
@@ -34,7 +34,7 @@ CONF=$DIR/config.json
 UNIT=/etc/systemd/system/realm.service
 INIT=systemd
 RUNLEVEL=/etc/runlevels/default
-RT=/usr/local/bin/realm
+RT=/usr/local/bin/r
 LOG=/var/log/realm.log
 LOCK=/run/lock/realm-manager.lock
 API=https://api.github.com/repos/zhboner/realm/releases/latest
@@ -442,7 +442,7 @@ uninstall() {
     svc reload || return 1
     rm -rf -- "$DIR" || return 1
     rm -f -- "$LOG" "$LOG".* "$RT" "$LOCK" || return 1
-    printf '卸载完成：服务、核心、规则、备份、独立日志和 realm 命令已清理。\n'
+    printf '卸载完成：服务、核心、规则、备份、独立日志和 r 命令已清理。\n'
 }
 
 menu() {
