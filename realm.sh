@@ -29,7 +29,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
 fi
 
 DIR=/root/realm
-SCRIPT_VERSION=1.0.7
+SCRIPT_VERSION=1.0.8
 BIN=$DIR/realm
 CONF=$DIR/config.json
 UNIT=/etc/systemd/system/realm.service
@@ -729,11 +729,12 @@ menu() {
         count=$(jq '.endpoints|length' "$CONF") || return 1
         header_pad=$((7-${#count})); (( header_pad > 0 )) || header_pad=1
         printf '%s' "$BLUE"
-        printf '  RRRR   EEEEE   AAA   L      M   M\n'
-        printf '  R   R  E      A   A  L      MM MM\n'
-        printf '  RRRR   EEEE   AAAAA  L      M M M\n'
-        printf '  R R    E      A   A  L      M   M\n'
-        printf '  R  RR  EEEEE  A   A  LLLLL  M   M%s\n\n' "$NC"
+        printf '  ██████╗ ███████╗ █████╗ ██╗     ███╗   ███╗\n'
+        printf '  ██╔══██╗██╔════╝██╔══██╗██║     ████╗ ████║\n'
+        printf '  ██████╔╝█████╗  ███████║██║     ██╔████╔██║\n'
+        printf '  ██╔══██╗██╔══╝  ██╔══██║██║     ██║╚██╔╝██║\n'
+        printf '  ██║  ██║███████╗██║  ██║███████╗██║ ╚═╝ ██║\n'
+        printf '  ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚══════╝╚═╝     ╚═╝%s\n\n' "$NC"
         printf '\n%s  ╔═══════════════════════════════════════╗\n' "$BLUE"
         printf '  ║    端口转发管理 (当前规则: %s%s%s 条)%*s║\n' "$GREEN" "$count" "$BLUE" "$header_pad" ''
         printf '  ║    管理脚本: %sv%s%s%*s║\n' "$GREEN" "$SCRIPT_VERSION" "$BLUE" "$((24-${#SCRIPT_VERSION}))" ''
