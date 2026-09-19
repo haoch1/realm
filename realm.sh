@@ -157,7 +157,7 @@ acquire_lock() {
             fi
             sleep 0.1
         done
-        fail "旧管理脚本仍在执行操作，请稍后重试（PID: $holder）。"
+        fail "旧端口转发脚本仍在执行操作，请稍后重试（PID: $holder）。"
         return 1
     fi
 
@@ -466,32 +466,32 @@ update_script() (
     trap 'rm -f -- "$temp"' EXIT
     trap interrupt_exit INT
     trap 'exit 143' TERM HUP
-    printf '  正在获取最新管理脚本版本...\n'
-    get "${SCRIPT_URL}?v=$$-$RANDOM" "$temp" || { fail '管理脚本下载失败，请检查 GitHub 连接。'; exit 1; }
+    printf '  正在获取最新端口转发脚本版本...\n'
+    get "${SCRIPT_URL}?v=$$-$RANDOM" "$temp" || { fail '端口转发脚本下载失败，请检查 GitHub 连接。'; exit 1; }
     IFS= read -r first_line < "$temp" || true
-    [[ $first_line == '#!/bin/sh' ]] || { fail '下载内容不是有效的管理脚本。'; exit 1; }
-    bash -n "$temp" || { fail '新版管理脚本语法检查失败，未替换当前版本。'; exit 1; }
+    [[ $first_line == '#!/bin/sh' ]] || { fail '下载内容不是有效的端口转发脚本。'; exit 1; }
+    bash -n "$temp" || { fail '新版端口转发脚本语法检查失败，未替换当前版本。'; exit 1; }
     new_version=$(sed -n 's/^SCRIPT_VERSION=\([0-9][0-9.]*\)$/\1/p' "$temp")
-    [[ $new_version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { fail '新版管理脚本缺少有效版本号。'; exit 1; }
+    [[ $new_version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { fail '新版端口转发脚本缺少有效版本号。'; exit 1; }
     printf '  当前版本: v%s → 最新版本: v%s\n' "$SCRIPT_VERSION" "$new_version"
     if [[ -f $RT ]]; then
         new_hash=$(sha256sum "$temp") || exit 1
         old_hash=$(sha256sum "$RT") || exit 1
         if [[ ${new_hash%% *} == "${old_hash%% *}" ]]; then
-            printf '  管理脚本已是最新版\n'
+            printf '  端口转发脚本已是最新版\n'
             exit 0
         fi
     fi
-    chmod 755 "$temp" && mv -f "$temp" "$RT" || { fail '管理脚本替换失败。'; exit 1; }
+    chmod 755 "$temp" && mv -f "$temp" "$RT" || { fail '端口转发脚本替换失败。'; exit 1; }
     trap - EXIT INT TERM HUP
-    printf '  管理脚本已更新至 v%s\n' "$new_version"
+    printf '  端口转发脚本已更新至 v%s\n' "$new_version"
 )
 
 reload_script() {
     trap - INT TERM HUP
     exec 9>&-
     exec bash "$RT"
-    fail '无法重新加载管理脚本，请重新运行 r。'
+    fail '无法重新加载端口转发脚本，请重新运行 r。'
 }
 
 valid_port() { [[ $1 =~ ^[0-9]{1,5}$ ]] && (( 10#$1 > 0 && 10#$1 < 65536 )); }
@@ -861,12 +861,12 @@ menu() {
             *) core_width=${#core} ;;
         esac
         core_pad=$((23-core_width)); (( core_pad > 0 )) || core_pad=1
-        script_pad=$((24-${#SCRIPT_VERSION})); (( script_pad > 0 )) || script_pad=1
+        script_pad=$((20-${#SCRIPT_VERSION})); (( script_pad > 0 )) || script_pad=1
         printf '\n%s  ╔═══════════════════════════════════════╗\n' "$BLUE"
         printf '  ║    端口转发管理（当前规则：%s%s%s 条）%*s║\n' "$GREEN" "$count" "$BLUE" "$header_pad" ''
         printf '  ║    Realm 状态：%s%s%s%*s║\n' "$GREEN" "$state" "$BLUE" "$state_pad" ''
         printf '  ║    Realm 版本：%s%s%s%*s║\n' "$GREEN" "$core" "$BLUE" "$core_pad" ''
-        printf '  ║    管理脚本：%sv%s%s%*s║\n' "$GREEN" "$SCRIPT_VERSION" "$BLUE" "$script_pad" ''
+        printf '  ║    端口转发脚本：%sv%s%s%*s║\n' "$GREEN" "$SCRIPT_VERSION" "$BLUE" "$script_pad" ''
         printf '  ╠═══════════════════════════════════════╣\n'
         printf '  ║  %s基础功能%29s║\n' "$BLUE" ''
         printf '  ║  %s[1]%s  添加转发规则%20s║\n' "$GREEN" "$BLUE" ''
@@ -882,7 +882,7 @@ menu() {
         printf '  ║%39s║\n' ''
         printf '  ║  %s更新与卸载%27s║\n' "$BLUE" ''
         printf '  ║  %s[9]%s  更新 Realm%22s║\n' "$GREEN" "$BLUE" ''
-        printf '  ║  %s[10]%s 更新管理脚本%20s║\n' "$GREEN" "$BLUE" ''
+        printf '  ║  %s[10]%s 更新端口转发脚本%16s║\n' "$GREEN" "$BLUE" ''
         printf '  ║  %s[11]%s 一键卸载%24s║\n' "$GREEN" "$BLUE" ''
         printf '  ║%39s║\n' ''
         printf '  ║  %s[0]%s  退出脚本%24s║\n' "$GREEN" "$BLUE" ''
@@ -902,7 +902,7 @@ menu() {
             8) printf '\n'; info '=== 重启 Realm ==='; printf '\n'; run_menu_action restart_realm || true ;;
             9) printf '\n'; info '=== 更新 Realm ==='; printf '\n'; run_menu_action update_realm || true ;;
             10)
-                printf '\n'; info '=== 更新管理脚本 ==='; printf '\n'
+                printf '\n'; info '=== 更新端口转发脚本 ==='; printf '\n'
                 if run_menu_action update_script; then
                     pause_enter '  按回车加载最新脚本...'
                     (( INPUT_EOF )) && return 0
@@ -922,8 +922,8 @@ menu() {
 main() {
     local command=${0##*/}
     case "${1:-}" in
-        -v|--version) printf 'Realm 管理脚本 v%s\n' "$SCRIPT_VERSION"; return 0 ;;
-        -h|--help) printf '用法：%s [--update|--update-script|--uninstall|--version]\n不带参数打开管理菜单；--update 更新 Realm；--update-script 更新管理脚本；--uninstall 卸载并清理全部规则；--version 查看管理脚本版本。\n' "$command"; return 0 ;;
+        -v|--version) printf 'Realm 端口转发脚本 v%s\n' "$SCRIPT_VERSION"; return 0 ;;
+        -h|--help) printf '用法：%s [--update|--update-script|--uninstall|--version]\n不带参数打开管理菜单；--update 更新 Realm；--update-script 更新端口转发脚本；--uninstall 卸载并清理全部规则；--version 查看端口转发脚本版本。\n' "$command"; return 0 ;;
         ''|--update|--update-script|--uninstall) ;;
         *) fail "用法：$command [--update|--update-script|--uninstall|--version]"; return 1 ;;
     esac
