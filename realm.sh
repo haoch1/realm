@@ -1,5 +1,5 @@
 #!/bin/sh
-# Realm 端口转发管理。首次启动时安装最新版；r --update 更新核心。
+# Realm 端口转发管理。首次添加规则时安装最新版；r --update 更新核心。
 
 # POSIX 启动段：Alpine 没有 Bash 时先安装，再交给 Bash 运行。
 install_packages() {
@@ -29,7 +29,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
 fi
 
 DIR=/root/realm
-SCRIPT_VERSION=1.1.0
+SCRIPT_VERSION=1.2.0
 BIN=$DIR/realm
 CONF=$DIR/config.json
 UNIT=/etc/systemd/system/realm.service
@@ -54,18 +54,26 @@ success() { printf '  %s[成功] %s%s\n' "$GREEN" "$*" "$NC"; }
 read_input() {
     local destination=$1 prompt=$2 reply='' status=0
     read -r -p "$prompt" reply || status=$?
-    if (( ${MENU_INTERRUPTED:-0} || status == 130 )) ||
-        [[ $reply == [qQ] || $reply == '^C' || $reply == *$'\003'* ]]; then
+    (( status == 130 )) && return 130
+    if [[ $reply == [qQ] ]]; then
         MENU_INTERRUPTED=1
-        return 130
+        return 1
     fi
     (( status == 0 )) || return "$status"
     printf -v "$destination" '%s' "$reply"
 }
-pause_enter() { read -r -p '  按回车继续...' _ || true; }
+pause_enter() {
+    local status=0
+    read -r -p '  按回车继续...' _ || status=$?
+    (( status == 130 )) && exit 130
+    return 0
+}
 pause_menu() {
+    local status=0
     printf '\n'
-    read -r -p '  按回车返回主菜单...' _ || true
+    read -r -p '  按回车返回主菜单...' _ || status=$?
+    (( status == 130 )) && exit 130
+    return 0
 }
 get() { curl -fLsS --retry 2 --connect-timeout 15 --max-time 180 --proto '=https' --proto-redir '=https' "$1" -o "$2"; } 9>&-
 version() {
@@ -313,6 +321,18 @@ service_state() {
     printf -v "$result" '%s' "$value"
 }
 
+core_version() {
+    local result=$1 value
+    if [[ ! -x $BIN ]]; then
+        value='未安装'
+    elif value=$(version "$BIN" 2>/dev/null); then
+        value="v$value"
+    else
+        value='未知'
+    fi
+    printf -v "$result" '%s' "$value"
+}
+
 rule_count() {
     jq -er '.endpoints | length' "$CONF"
 }
@@ -381,10 +401,11 @@ restart_realm() {
 }
 
 update_realm() (
-    local temp active=0 replaced=0 had=0 status sum member current
+    local temp active=0 replaced=0 had=0 status interrupted=0 sum member current
     temp=$(mktemp -d "$DIR/.download.XXXXXX") || exit 1
     cleanup() {
         status=$?
+        (( status == 130 )) && interrupted=1
         trap - EXIT
         trap '' INT TERM HUP
         if (( replaced )); then
@@ -396,7 +417,8 @@ update_realm() (
                 svc reset >/dev/null 2>&1 || true
                 svc restart && ready || fail '旧程序恢复后未能启动。'
             fi
-            fail '升级未成功，已尝试恢复原程序。'; status=1
+            fail '升级未成功，已尝试恢复原程序。'
+            (( interrupted )) || status=1
         fi
         rm -rf -- "$temp"
         exit "$status"
@@ -546,10 +568,11 @@ show_resolution() {
 }
 
 apply_rules() (
-    local candidate=$1 temp active=0 had_unit=0 changed=0 enabled=0 status count
+    local candidate=$1 temp active=0 had_unit=0 changed=0 enabled=0 status interrupted=0 count
     temp=$(mktemp -d "$DIR/.change.XXXXXX") || exit 1
     rollback() {
         status=$?
+        (( status == 130 )) && interrupted=1
         trap - EXIT
         trap '' INT TERM HUP
         if (( changed )); then
@@ -563,7 +586,8 @@ apply_rules() (
                 svc reset >/dev/null 2>&1 || true
                 svc restart && ready || fail '恢复旧服务失败。'
             fi
-            fail '修改未生效，已尝试恢复原规则。'; status=1
+            fail '修改未生效，已尝试恢复原规则。'
+            (( interrupted )) || status=1
         fi
         rm -rf -- "$temp"
         exit "$status"
@@ -799,21 +823,31 @@ uninstall() {
     printf '  卸载完成：服务、核心、规则、备份、独立日志和 r 命令已清理。\n'
 }
 
+run_menu_action() {
+    "$@"
+    local status=$?
+    (( status == 130 )) && exit 130
+    return "$status"
+}
+
 menu() {
-    local count choice index header_pad state state_pad script_pad
+    local count choice index header_pad state state_pad core core_pad script_pad
     MENU_INTERRUPTED=0
-    trap 'MENU_INTERRUPTED=1' INT
     while true; do
+        MENU_INTERRUPTED=0
         [[ -t 1 ]] && printf '\033[2J\033[H'
         count=$(jq '.endpoints|length' "$CONF") || return 1
         service_state state
-        header_pad=$((7-${#count})); (( header_pad > 0 )) || header_pad=1
-        state_pad=$((17));
-        script_pad=$((24-${#SCRIPT_VERSION})); (( script_pad > 0 )) || script_pad=1
+        core_version core
+        header_pad=$((6-${#count})); (( header_pad > 0 )) || header_pad=1
+        state_pad=16
+        if [[ $core == '未知' ]]; then core_pad=18; else core_pad=16; fi
+        script_pad=$((23-${#SCRIPT_VERSION})); (( script_pad > 0 )) || script_pad=1
         printf '\n%s  ╔═══════════════════════════════════════╗\n' "$BLUE"
-        printf '  ║    端口转发管理 (当前规则: %s%s%s 条)%*s║\n' "$GREEN" "$count" "$BLUE" "$header_pad" ''
-        printf '  ║    Realm 状态: %s%s%s%*s║\n' "$GREEN" "$state" "$BLUE" "$state_pad" ''
-        printf '  ║    管理脚本: %sv%s%s%*s║\n' "$GREEN" "$SCRIPT_VERSION" "$BLUE" "$script_pad" ''
+        printf '  ║    端口转发管理（当前规则：%s%s%s 条）%*s║\n' "$GREEN" "$count" "$BLUE" "$header_pad" ''
+        printf '  ║    Realm 状态：%s%s%s%*s║\n' "$GREEN" "$state" "$BLUE" "$state_pad" ''
+        printf '  ║    Realm 版本：%s%s%s%*s║\n' "$GREEN" "$core" "$BLUE" "$core_pad" ''
+        printf '  ║    管理脚本：%sv%s%s%*s║\n' "$GREEN" "$SCRIPT_VERSION" "$BLUE" "$script_pad" ''
         printf '  ╠═══════════════════════════════════════╣\n'
         printf '  ║  %s基础功能%29s║\n' "$BLUE" ''
         printf '  ║  %s[1]%s  添加转发规则%20s║\n' "$GREEN" "$BLUE" ''
@@ -831,31 +865,30 @@ menu() {
         printf '  ║  %s[9]%s  更新 Realm%22s║\n' "$GREEN" "$BLUE" ''
         printf '  ║  %s[10]%s 更新管理脚本%20s║\n' "$GREEN" "$BLUE" ''
         printf '  ║  %s[11]%s 一键卸载%24s║\n' "$GREEN" "$BLUE" ''
+        printf '  ║%39s║\n' ''
         printf '  ║  %s[0]%s  退出脚本%24s║\n' "$GREEN" "$BLUE" ''
         printf '  ╚═══════════════════════════════════════╝%s\n\n' "$NC"
-        MENU_INTERRUPTED=0
-        if ! read -r -p '  请输入选项 [0-11]: ' choice; then
-            if (( MENU_INTERRUPTED )); then pause_menu; continue; fi
-            trap - INT
-            return 0
-        fi
+        read -r -p '  请输入选项 [0-11]: ' choice
+        local status=$?
+        (( status == 130 )) && return 130
+        (( status == 0 )) || return 0
         MENU_INTERRUPTED=0
         case "$choice" in
-            1) edit_rule || true ;;
-            2) view_rules ;;
-            3) choose_rule index '修改' && edit_rule "$index" || true ;;
-            4) choose_rule index '删除' && delete_rules "$index" || true ;;
-            5) delete_rules -1 || true ;;
-            6) printf '\n'; info '=== 启动 Realm ==='; printf '\n'; start_realm || true ;;
-            7) printf '\n'; info '=== 停止 Realm ==='; printf '\n'; stop_realm || true ;;
-            8) printf '\n'; info '=== 重启 Realm ==='; printf '\n'; restart_realm || true ;;
-            9) printf '\n'; info '=== 更新 Realm ==='; printf '\n'; update_realm || true ;;
+            1) run_menu_action edit_rule || true ;;
+            2) run_menu_action view_rules || true ;;
+            3) run_menu_action choose_rule index '修改' && run_menu_action edit_rule "$index" || true ;;
+            4) run_menu_action choose_rule index '删除' && run_menu_action delete_rules "$index" || true ;;
+            5) run_menu_action delete_rules -1 || true ;;
+            6) printf '\n'; info '=== 启动 Realm ==='; printf '\n'; run_menu_action start_realm || true ;;
+            7) printf '\n'; info '=== 停止 Realm ==='; printf '\n'; run_menu_action stop_realm || true ;;
+            8) printf '\n'; info '=== 重启 Realm ==='; printf '\n'; run_menu_action restart_realm || true ;;
+            9) printf '\n'; info '=== 更新 Realm ==='; printf '\n'; run_menu_action update_realm || true ;;
             10)
                 printf '\n'; info '=== 更新管理脚本 ==='; printf '\n'
-                if update_script; then pause_enter; reload_script; return; fi
+                if run_menu_action update_script; then pause_enter; reload_script; return; fi
                 ;;
-            11) if uninstall; then trap - INT; return 0; fi ;;
-            0) trap - INT; return 0 ;;
+            11) if run_menu_action uninstall; then return 0; fi ;;
+            0) return 0 ;;
             *) fail '无效选项。' ;;
         esac
         if (( MENU_INTERRUPTED )); then pause_menu; else pause_enter; fi
@@ -874,6 +907,7 @@ main() {
         fail '请在 Linux VPS/容器中以 root 或 sudo 运行。'; return 1;
     }
     umask 077
+    trap 'exit 130' INT
     detect_init && dependencies || return 1
     mkdir -p /run/lock || return 1
     acquire_lock || return 1
@@ -885,7 +919,6 @@ main() {
     if [[ ${1:-} == --update ]]; then
         update_realm
     else
-        if ! version "$BIN" >/dev/null 2>&1; then update_realm || return 1; fi
         menu
     fi
 }
