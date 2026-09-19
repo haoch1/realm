@@ -29,7 +29,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
 fi
 
 DIR=/root/realm
-SCRIPT_VERSION=1.0.6
+SCRIPT_VERSION=1.1.0
 BIN=$DIR/realm
 CONF=$DIR/config.json
 UNIT=/etc/systemd/system/realm.service
@@ -299,6 +299,85 @@ ready() {
         (( found )) && return 0
     done
     fail 'Realm 启动失败或端口未监听。systemd 查看 journalctl -u realm；OpenRC 查看 /var/log/realm.log。'
+}
+
+service_state() {
+    local result=$1 value
+    if [[ ! -x $BIN ]]; then
+        value='未安装'
+    elif svc active 2>/dev/null; then
+        value='运行中'
+    else
+        value='已停止'
+    fi
+    printf -v "$result" '%s' "$value"
+}
+
+rule_count() {
+    jq -er '.endpoints | length' "$CONF"
+}
+
+start_realm() {
+    local count was_enabled=0
+    count=$(rule_count) || return 1
+    (( count )) || { warn '暂无转发规则，无法启动 Realm。'; return 1; }
+    svc enabled 2>/dev/null && was_enabled=1
+    if [[ ! -f $UNIT ]]; then
+        write_unit || { fail 'Realm 服务配置创建失败。'; return 1; }
+    fi
+    if ! (( was_enabled )); then
+        svc enable >/dev/null 2>&1 || { fail 'Realm 开机自启设置失败。'; return 1; }
+    fi
+    if svc active 2>/dev/null; then
+        success 'Realm 已在运行，开机自启已开启。'
+        return 0
+    fi
+    if svc start >/dev/null 2>&1 && ready; then
+        success 'Realm 已启动，开机自启已开启。'
+        return 0
+    fi
+    (( was_enabled )) || svc disable >/dev/null 2>&1 || true
+    fail 'Realm 启动失败，已恢复原开机自启状态。'
+    return 1
+}
+
+stop_realm() {
+    local active=0 enabled=0
+    svc active 2>/dev/null && active=1
+    svc enabled 2>/dev/null && enabled=1
+    if (( !active && !enabled )); then
+        info 'Realm 已停止，且开机自启未开启。'
+        return 0
+    fi
+    if (( active )) && ! svc stop >/dev/null 2>&1; then
+        fail 'Realm 停止失败，开机自启保持不变。'
+        return 1
+    fi
+    if (( enabled )) && ! svc disable >/dev/null 2>&1; then
+        fail 'Realm 已停止，但取消开机自启失败。'
+        return 1
+    fi
+    if svc active 2>/dev/null || svc enabled 2>/dev/null; then
+        fail 'Realm 状态未完全停止，请稍后检查。'
+        return 1
+    fi
+    success 'Realm 已停止，开机自启已关闭。'
+}
+
+restart_realm() {
+    local count
+    count=$(rule_count) || return 1
+    (( count )) || { warn '暂无转发规则，无法重启 Realm。'; return 1; }
+    if [[ ! -f $UNIT ]]; then
+        write_unit || { fail 'Realm 服务配置创建失败。'; return 1; }
+    fi
+    svc enable >/dev/null 2>&1 || { fail 'Realm 开机自启设置失败，未执行重启。'; return 1; }
+    if svc restart >/dev/null 2>&1 && ready; then
+        success 'Realm 已重启，开机自启已开启。'
+        return 0
+    fi
+    fail 'Realm 重启失败，请检查服务日志。'
+    return 1
 }
 
 update_realm() (
@@ -721,29 +800,39 @@ uninstall() {
 }
 
 menu() {
-    local count choice index header_pad
+    local count choice index header_pad state state_pad
     MENU_INTERRUPTED=0
     trap 'MENU_INTERRUPTED=1' INT
     while true; do
         [[ -t 1 ]] && printf '\033[2J\033[H'
         count=$(jq '.endpoints|length' "$CONF") || return 1
-        header_pad=$((7-${#count})); (( header_pad > 0 )) || header_pad=1
-        printf '\n%s  ╔═══════════════════════════════════════╗\n' "$BLUE"
+        service_state state
+        header_pad=$((25-${#count})); (( header_pad > 0 )) || header_pad=1
+        state_pad=$((20-${#SCRIPT_VERSION})); (( state_pad > 0 )) || state_pad=1
+        printf '\n%s  ╔═════════════════════════════════════════════════════════╗\n' "$BLUE"
         printf '  ║    端口转发管理 (当前规则: %s%s%s 条)%*s║\n' "$GREEN" "$count" "$BLUE" "$header_pad" ''
-        printf '  ║    管理脚本: %sv%s%s%*s║\n' "$GREEN" "$SCRIPT_VERSION" "$BLUE" "$((24-${#SCRIPT_VERSION}))" ''
-        printf '  ╠═══════════════════════════════════════╣\n'
-        printf '  ║  %s[1]%s 添加转发规则%21s║\n' "$GREEN" "$BLUE" ''
-        printf '  ║  %s[2]%s 查看当前转发规则%17s║\n' "$GREEN" "$BLUE" ''
-        printf '  ║  %s[3]%s 修改转发规则%21s║\n' "$GREEN" "$BLUE" ''
-        printf '  ║  %s[4]%s 删除转发规则%21s║\n' "$GREEN" "$BLUE" ''
-        printf '  ║  %s[5]%s 清空所有转发规则%17s║\n' "$GREEN" "$BLUE" ''
-        printf '  ║  %s[6]%s 更新 Realm%23s║\n' "$GREEN" "$BLUE" ''
-        printf '  ║  %s[7]%s 更新管理脚本%21s║\n' "$GREEN" "$BLUE" ''
-        printf '  ║  %s[8]%s 一键卸载%25s║\n' "$GREEN" "$BLUE" ''
-        printf '  ║  %s[0]%s 退出脚本%25s║\n' "$GREEN" "$BLUE" ''
-        printf '  ╚═══════════════════════════════════════╝%s\n\n' "$NC"
+        printf '  ║    Realm 状态: %s%s%s    管理脚本: %sv%s%s%*s║\n' "$GREEN" "$state" "$BLUE" "$GREEN" "$SCRIPT_VERSION" "$BLUE" "$state_pad" ''
+        printf '  ╠═════════════════════════════════════════════════════════╣\n'
+        printf '  ║  %s基础功能%47s║\n' "$BLUE" ''
+        printf '  ║  %s[1]%s 添加转发规则%39s║\n' "$GREEN" "$BLUE" ''
+        printf '  ║  %s[2]%s 查看当前转发规则%35s║\n' "$GREEN" "$BLUE" ''
+        printf '  ║  %s[3]%s 修改转发规则%39s║\n' "$GREEN" "$BLUE" ''
+        printf '  ║  %s[4]%s 删除转发规则%39s║\n' "$GREEN" "$BLUE" ''
+        printf '  ║  %s[5]%s 清空所有转发规则%35s║\n' "$GREEN" "$BLUE" ''
+        printf '  ║%57s║\n' ''
+        printf '  ║  %s服务管理%47s║\n' "$BLUE" ''
+        printf '  ║  %s[6]%s 启动 Realm%41s║\n' "$GREEN" "$BLUE" ''
+        printf '  ║  %s[7]%s 停止 Realm%41s║\n' "$GREEN" "$BLUE" ''
+        printf '  ║  %s[8]%s 重启 Realm%41s║\n' "$GREEN" "$BLUE" ''
+        printf '  ║%57s║\n' ''
+        printf '  ║  %s更新与卸载%45s║\n' "$BLUE" ''
+        printf '  ║  %s[9]%s 更新 Realm%41s║\n' "$GREEN" "$BLUE" ''
+        printf '  ║  %s[10]%s 更新管理脚本%38s║\n' "$GREEN" "$BLUE" ''
+        printf '  ║  %s[11]%s 一键卸载%42s║\n' "$GREEN" "$BLUE" ''
+        printf '  ║  %s[0]%s 退出脚本%43s║\n' "$GREEN" "$BLUE" ''
+        printf '  ╚═════════════════════════════════════════════════════════╝%s\n\n' "$NC"
         MENU_INTERRUPTED=0
-        if ! read -r -p '  请输入选项 [0-8]: ' choice; then
+        if ! read -r -p '  请输入选项 [0-11]: ' choice; then
             if (( MENU_INTERRUPTED )); then pause_menu; continue; fi
             trap - INT
             return 0
@@ -755,12 +844,15 @@ menu() {
             3) choose_rule index '修改' && edit_rule "$index" || true ;;
             4) choose_rule index '删除' && delete_rules "$index" || true ;;
             5) delete_rules -1 || true ;;
-            6) printf '\n'; info '=== 更新 Realm ==='; printf '\n'; update_realm || true ;;
-            7)
+            6) printf '\n'; info '=== 启动 Realm ==='; printf '\n'; start_realm || true ;;
+            7) printf '\n'; info '=== 停止 Realm ==='; printf '\n'; stop_realm || true ;;
+            8) printf '\n'; info '=== 重启 Realm ==='; printf '\n'; restart_realm || true ;;
+            9) printf '\n'; info '=== 更新 Realm ==='; printf '\n'; update_realm || true ;;
+            10)
                 printf '\n'; info '=== 更新管理脚本 ==='; printf '\n'
                 if update_script; then pause_enter; reload_script; return; fi
                 ;;
-            8) if uninstall; then trap - INT; return 0; fi ;;
+            11) if uninstall; then trap - INT; return 0; fi ;;
             0) trap - INT; return 0 ;;
             *) fail '无效选项。' ;;
         esac
