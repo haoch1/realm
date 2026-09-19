@@ -29,7 +29,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
 fi
 
 DIR=/root/realm
-SCRIPT_VERSION=1.2.1
+SCRIPT_VERSION=1.2.2
 BIN=$DIR/realm
 CONF=$DIR/config.json
 UNIT=/etc/systemd/system/realm.service
@@ -399,7 +399,7 @@ restart_realm() {
 }
 
 update_realm() (
-    local temp active=0 replaced=0 had=0 status interrupted=0 sum member current
+    local temp active=0 replaced=0 had=0 status interrupted=0 sum member current current_display
     temp=$(mktemp -d "$DIR/.download.XXXXXX") || exit 1
     cleanup() {
         status=$?
@@ -424,12 +424,20 @@ update_realm() (
     trap cleanup EXIT
     trap interrupt_exit INT
     trap 'exit 143' TERM HUP
-    printf '  正在获取 Realm 最新稳定版...\n'
+    printf '  正在获取最新 Realm 版本...\n'
     get "$API" "$temp/release.json" && select_asset "$temp/release.json" "$(uname -m)" || {
         fail '获取最新版本失败，请检查 GitHub 访问或 API 限流。'; exit 1;
     }
     current=$(version "$BIN" 2>/dev/null) || current=''
-    [[ $current != "${TAG#v}" ]] || { printf '  已是最新版 %s\n' "$TAG"; exit 0; }
+    if [[ -n $current ]]; then
+        current_display="v$current"
+    elif [[ -x $BIN ]]; then
+        current_display='未知'
+    else
+        current_display='未安装'
+    fi
+    printf '  当前版本: %s → 最新版本: %s\n' "$current_display" "$TAG"
+    [[ $current != "${TAG#v}" ]] || { printf '  Realm 已是最新版\n'; exit 0; }
     get "$URL" "$temp/package.tar.gz" || exit 1
     sum=$(sha256sum "$temp/package.tar.gz") || exit 1
     [[ ${sum%% *} == "${HASH#sha256:}" ]] || { fail 'SHA256 校验失败。'; exit 1; }
@@ -458,7 +466,7 @@ update_script() (
     trap 'rm -f -- "$temp"' EXIT
     trap interrupt_exit INT
     trap 'exit 143' TERM HUP
-    printf '  正在获取最新管理脚本...\n'
+    printf '  正在获取最新管理脚本版本...\n'
     get "${SCRIPT_URL}?v=$$-$RANDOM" "$temp" || { fail '管理脚本下载失败，请检查 GitHub 连接。'; exit 1; }
     IFS= read -r first_line < "$temp" || true
     [[ $first_line == '#!/bin/sh' ]] || { fail '下载内容不是有效的管理脚本。'; exit 1; }
@@ -470,13 +478,13 @@ update_script() (
         new_hash=$(sha256sum "$temp") || exit 1
         old_hash=$(sha256sum "$RT") || exit 1
         if [[ ${new_hash%% *} == "${old_hash%% *}" ]]; then
-            printf '  管理脚本已是最新版。\n'
+            printf '  管理脚本已是最新版\n'
             exit 0
         fi
     fi
     chmod 755 "$temp" && mv -f "$temp" "$RT" || { fail '管理脚本替换失败。'; exit 1; }
     trap - EXIT INT TERM HUP
-    success '管理脚本已更新。'
+    printf '  管理脚本已更新至 v%s\n' "$new_version"
 )
 
 reload_script() {
