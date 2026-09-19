@@ -29,7 +29,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
 fi
 
 DIR=/root/realm
-SCRIPT_VERSION=1.2.0
+SCRIPT_VERSION=1.2.1
 BIN=$DIR/realm
 CONF=$DIR/config.json
 UNIT=/etc/systemd/system/realm.service
@@ -51,28 +51,26 @@ fail() { printf '  %s[错误] %s%s\n' "$RED" "$*" "$NC" >&2; return 1; }
 info() { printf '  %s[信息] %s%s\n' "$BLUE" "$*" "$NC"; }
 warn() { printf '  %s[注意] %s%s\n' "$YELLOW" "$*" "$NC"; }
 success() { printf '  %s[成功] %s%s\n' "$GREEN" "$*" "$NC"; }
+interrupt_exit() { printf '\n'; exit 130; }
 read_input() {
     local destination=$1 prompt=$2 reply='' status=0
     read -r -p "$prompt" reply || status=$?
     (( status == 130 )) && return 130
+    if (( status != 0 )); then
+        INPUT_EOF=1
+        return "$status"
+    fi
     if [[ $reply == [qQ] ]]; then
-        MENU_INTERRUPTED=1
+        MENU_CANCELLED=1
         return 1
     fi
-    (( status == 0 )) || return "$status"
     printf -v "$destination" '%s' "$reply"
 }
 pause_enter() {
-    local status=0
-    read -r -p '  按回车继续...' _ || status=$?
-    (( status == 130 )) && exit 130
-    return 0
-}
-pause_menu() {
-    local status=0
-    printf '\n'
-    read -r -p '  按回车返回主菜单...' _ || status=$?
-    (( status == 130 )) && exit 130
+    local prompt=${1:-'  按回车返回主菜单...'} status=0
+    read -r -p "$prompt" _ || status=$?
+    (( status == 130 )) && interrupt_exit
+    (( status != 0 )) && INPUT_EOF=1
     return 0
 }
 get() { curl -fLsS --retry 2 --connect-timeout 15 --max-time 180 --proto '=https' --proto-redir '=https' "$1" -o "$2"; } 9>&-
@@ -424,7 +422,7 @@ update_realm() (
         exit "$status"
     }
     trap cleanup EXIT
-    trap 'exit 130' INT
+    trap interrupt_exit INT
     trap 'exit 143' TERM HUP
     printf '  正在获取 Realm 最新稳定版...\n'
     get "$API" "$temp/release.json" && select_asset "$temp/release.json" "$(uname -m)" || {
@@ -458,7 +456,7 @@ update_script() (
     local temp first_line new_hash old_hash new_version
     temp=$(mktemp "${RT%/*}/.realm-manager.XXXXXX") || exit 1
     trap 'rm -f -- "$temp"' EXIT
-    trap 'exit 130' INT
+    trap interrupt_exit INT
     trap 'exit 143' TERM HUP
     printf '  正在获取最新管理脚本...\n'
     get "${SCRIPT_URL}?v=$$-$RANDOM" "$temp" || { fail '管理脚本下载失败，请检查 GitHub 连接。'; exit 1; }
@@ -552,7 +550,6 @@ show_resolution() {
     local host=$1 output address resolved='' family=''
     [[ $host != *:* ]] && ! valid_ipv4 "$host" || return 0
     output=$(timeout 5 getent ahosts "$host" 9>&- 2>/dev/null) || output=''
-    (( ${MENU_INTERRUPTED:-0} )) && return 130
     while read -r address _; do
         if valid_ipv4 "$address"; then
             resolved=$address; family=ipv4; break
@@ -593,10 +590,15 @@ apply_rules() (
         exit "$status"
     }
     trap rollback EXIT
-    trap 'exit 130' INT
+    trap interrupt_exit INT
     trap 'exit 143' TERM HUP
     count=$(jq -er '.endpoints | length' "$candidate") || exit 1
-    if (( count )) && { [[ ! -x $BIN ]] || ! version "$BIN" >/dev/null 2>&1; }; then update_realm || exit 1; fi
+    if (( count )) && { [[ ! -x $BIN ]] || ! version "$BIN" >/dev/null 2>&1; }; then
+        update_realm
+        status=$?
+        (( status == 130 )) && exit 130
+        (( status == 0 )) || exit 1
+    fi
     cp -p "$CONF" "$temp/config" && cp -p "$CONF" "$CONF.bak" || exit 1
     if [[ -f $UNIT ]]; then cp -p "$UNIT" "$temp/unit" || exit 1; had_unit=1; fi
     if svc active; then active=1; fi
@@ -647,7 +649,7 @@ choose_rule() {
     print_rules >&2
     printf '\n' >&2
     read_input n "  请输入要${action}的序号 (0 取消): " || return 1
-    [[ -n $n && $n != 0 ]] || return 1
+    [[ -n $n && $n != 0 ]] || { MENU_CANCELLED=1; return 1; }
     [[ $n =~ ^[0-9]{1,6}$ ]] && (( 10#$n > 0 && 10#$n <= count )) || { fail '无效选择'; return 1; }
     printf -v "$result" '%d' "$((10#$n-1))"
 }
@@ -685,6 +687,7 @@ save_rule() {
         fail "${proto^^} 端口 $port 已被占用。"; return 1
     done
     temp=$(mktemp "$DIR/.rules.XXXXXX") || return 1
+    trap 'rm -f -- "$temp"; interrupt_exit' INT
     # 保留已有规则的监听地址；新规则默认 IPv4 全接口。
     local listen="${current%:*}:$port"
     [[ -n $current ]] || listen="0.0.0.0:$port"
@@ -694,6 +697,7 @@ save_rule() {
         | if $i<0 then .endpoints += [$rule + {network:$net}]
           else .endpoints[$i] |= (. + $rule | .network = ((.network // {}) + $net)) end' "$CONF" > "$temp" && apply_rules "$temp"
     local status=$?
+    trap interrupt_exit INT
     rm -f "$temp"
     if (( status == 0 )); then
         if (( index < 0 )); then
@@ -786,13 +790,15 @@ delete_rules() {
         printf '\n'
         warn "确认清空全部 ${count} 条端口转发规则？"
         read_input answer '  (y/N): ' || return 1
-        [[ $answer == y || $answer == Y ]] || return 0
+        [[ $answer == y || $answer == Y ]] || { MENU_CANCELLED=1; return 1; }
     else
         selected_port=$(jq -r --argjson i "$index" '.endpoints[$i].listen | split(":") | last' "$CONF") || return 1
     fi
     temp=$(mktemp "$DIR/.rules.XXXXXX") || return 1
+    trap 'rm -f -- "$temp"; interrupt_exit' INT
     jq --argjson i "$index" 'if $i<0 then .endpoints=[] else del(.endpoints[$i]) end' "$CONF" > "$temp" && apply_rules "$temp"
     status=$?
+    trap interrupt_exit INT
     rm -f "$temp"
     if (( status == 0 )); then
         if (( index == -1 )); then success '所有端口转发规则已清空';
@@ -809,7 +815,7 @@ uninstall() {
     printf '\n'
     warn '卸载将删除 Realm、全部规则和备份，是否继续？'
     read_input answer '  (y/N): ' || return 1
-    [[ $answer == y || $answer == Y ]] || return 1
+    [[ $answer == y || $answer == Y ]] || { MENU_CANCELLED=1; return 1; }
     check_service || return 1
     if [[ -f $UNIT ]] || svc active; then svc stop >/dev/null 2>&1 || { fail '停止服务失败，未删除文件。'; return 1; }; fi
     if svc enabled 2>/dev/null; then svc disable || { fail '取消自启失败，未删除文件。'; return 1; }; fi
@@ -826,23 +832,28 @@ uninstall() {
 run_menu_action() {
     "$@"
     local status=$?
-    (( status == 130 )) && exit 130
+    (( status == 130 )) && interrupt_exit
     return "$status"
 }
 
 menu() {
-    local count choice index header_pad state state_pad core core_pad script_pad
-    MENU_INTERRUPTED=0
+    local count choice index header_pad state state_pad core core_width core_pad script_pad
+    MENU_CANCELLED=0 INPUT_EOF=0
     while true; do
-        MENU_INTERRUPTED=0
+        MENU_CANCELLED=0 INPUT_EOF=0
         [[ -t 1 ]] && printf '\033[2J\033[H'
         count=$(jq '.endpoints|length' "$CONF") || return 1
         service_state state
         core_version core
         header_pad=$((6-${#count})); (( header_pad > 0 )) || header_pad=1
-        state_pad=16
-        if [[ $core == '未知' ]]; then core_pad=18; else core_pad=16; fi
-        script_pad=$((23-${#SCRIPT_VERSION})); (( script_pad > 0 )) || script_pad=1
+        state_pad=17
+        case $core in
+            未安装) core_width=6 ;;
+            未知) core_width=4 ;;
+            *) core_width=${#core} ;;
+        esac
+        core_pad=$((23-core_width)); (( core_pad > 0 )) || core_pad=1
+        script_pad=$((24-${#SCRIPT_VERSION})); (( script_pad > 0 )) || script_pad=1
         printf '\n%s  ╔═══════════════════════════════════════╗\n' "$BLUE"
         printf '  ║    端口转发管理（当前规则：%s%s%s 条）%*s║\n' "$GREEN" "$count" "$BLUE" "$header_pad" ''
         printf '  ║    Realm 状态：%s%s%s%*s║\n' "$GREEN" "$state" "$BLUE" "$state_pad" ''
@@ -870,9 +881,8 @@ menu() {
         printf '  ╚═══════════════════════════════════════╝%s\n\n' "$NC"
         read -r -p '  请输入选项 [0-11]: ' choice
         local status=$?
-        (( status == 130 )) && return 130
+        (( status == 130 )) && interrupt_exit
         (( status == 0 )) || return 0
-        MENU_INTERRUPTED=0
         case "$choice" in
             1) run_menu_action edit_rule || true ;;
             2) run_menu_action view_rules || true ;;
@@ -885,13 +895,19 @@ menu() {
             9) printf '\n'; info '=== 更新 Realm ==='; printf '\n'; run_menu_action update_realm || true ;;
             10)
                 printf '\n'; info '=== 更新管理脚本 ==='; printf '\n'
-                if run_menu_action update_script; then pause_enter; reload_script; return; fi
+                if run_menu_action update_script; then
+                    pause_enter '  按回车加载最新脚本...'
+                    (( INPUT_EOF )) && return 0
+                    reload_script
+                    return
+                fi
                 ;;
             11) if run_menu_action uninstall; then return 0; fi ;;
             0) return 0 ;;
             *) fail '无效选项。' ;;
         esac
-        if (( MENU_INTERRUPTED )); then pause_menu; else pause_enter; fi
+        (( MENU_CANCELLED )) || pause_enter
+        (( INPUT_EOF )) && return 0
     done
 }
 
@@ -907,7 +923,7 @@ main() {
         fail '请在 Linux VPS/容器中以 root 或 sudo 运行。'; return 1;
     }
     umask 077
-    trap 'exit 130' INT
+    trap interrupt_exit INT
     detect_init && dependencies || return 1
     mkdir -p /run/lock || return 1
     acquire_lock || return 1
