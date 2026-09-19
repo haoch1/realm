@@ -807,30 +807,30 @@ menu() {
         [[ -t 1 ]] && printf '\033[2J\033[H'
         count=$(jq '.endpoints|length' "$CONF") || return 1
         service_state state
-        header_pad=$((25-${#count})); (( header_pad > 0 )) || header_pad=1
-        state_pad=$((20-${#SCRIPT_VERSION})); (( state_pad > 0 )) || state_pad=1
-        printf '\n%s  ╔═════════════════════════════════════════════════════════╗\n' "$BLUE"
+        header_pad=$((7-${#count})); (( header_pad > 0 )) || header_pad=1
+        state_pad=$((5-${#SCRIPT_VERSION})); (( state_pad > 0 )) || state_pad=0
+        printf '\n%s  ╔═══════════════════════════════════════╗\n' "$BLUE"
         printf '  ║    端口转发管理 (当前规则: %s%s%s 条)%*s║\n' "$GREEN" "$count" "$BLUE" "$header_pad" ''
-        printf '  ║    Realm 状态: %s%s%s    管理脚本: %sv%s%s%*s║\n' "$GREEN" "$state" "$BLUE" "$GREEN" "$SCRIPT_VERSION" "$BLUE" "$state_pad" ''
-        printf '  ╠═════════════════════════════════════════════════════════╣\n'
-        printf '  ║  %s基础功能%47s║\n' "$BLUE" ''
-        printf '  ║  %s[1]%s 添加转发规则%39s║\n' "$GREEN" "$BLUE" ''
-        printf '  ║  %s[2]%s 查看当前转发规则%35s║\n' "$GREEN" "$BLUE" ''
-        printf '  ║  %s[3]%s 修改转发规则%39s║\n' "$GREEN" "$BLUE" ''
-        printf '  ║  %s[4]%s 删除转发规则%39s║\n' "$GREEN" "$BLUE" ''
-        printf '  ║  %s[5]%s 清空所有转发规则%35s║\n' "$GREEN" "$BLUE" ''
-        printf '  ║%57s║\n' ''
-        printf '  ║  %s服务管理%47s║\n' "$BLUE" ''
-        printf '  ║  %s[6]%s 启动 Realm%41s║\n' "$GREEN" "$BLUE" ''
-        printf '  ║  %s[7]%s 停止 Realm%41s║\n' "$GREEN" "$BLUE" ''
-        printf '  ║  %s[8]%s 重启 Realm%41s║\n' "$GREEN" "$BLUE" ''
-        printf '  ║%57s║\n' ''
-        printf '  ║  %s更新与卸载%45s║\n' "$BLUE" ''
-        printf '  ║  %s[9]%s 更新 Realm%41s║\n' "$GREEN" "$BLUE" ''
-        printf '  ║  %s[10]%s 更新管理脚本%38s║\n' "$GREEN" "$BLUE" ''
-        printf '  ║  %s[11]%s 一键卸载%42s║\n' "$GREEN" "$BLUE" ''
-        printf '  ║  %s[0]%s 退出脚本%43s║\n' "$GREEN" "$BLUE" ''
-        printf '  ╚═════════════════════════════════════════════════════════╝%s\n\n' "$NC"
+        printf '  ║    Realm 状态: %s%s%s 管理脚本: %sv%s%s%*s║\n' "$GREEN" "$state" "$BLUE" "$GREEN" "$SCRIPT_VERSION" "$BLUE" "$state_pad" ''
+        printf '  ╠═══════════════════════════════════════╣\n'
+        printf '  ║  %s基础功能%29s║\n' "$BLUE" ''
+        printf '  ║  %s[1]%s 添加转发规则%21s║\n' "$GREEN" "$BLUE" ''
+        printf '  ║  %s[2]%s 查看当前转发规则%17s║\n' "$GREEN" "$BLUE" ''
+        printf '  ║  %s[3]%s 修改转发规则%21s║\n' "$GREEN" "$BLUE" ''
+        printf '  ║  %s[4]%s 删除转发规则%21s║\n' "$GREEN" "$BLUE" ''
+        printf '  ║  %s[5]%s 清空所有转发规则%17s║\n' "$GREEN" "$BLUE" ''
+        printf '  ║%39s║\n' ''
+        printf '  ║  %s服务管理%29s║\n' "$BLUE" ''
+        printf '  ║  %s[6]%s 启动 Realm%23s║\n' "$GREEN" "$BLUE" ''
+        printf '  ║  %s[7]%s 停止 Realm%23s║\n' "$GREEN" "$BLUE" ''
+        printf '  ║  %s[8]%s 重启 Realm%23s║\n' "$GREEN" "$BLUE" ''
+        printf '  ║%39s║\n' ''
+        printf '  ║  %s更新与卸载%27s║\n' "$BLUE" ''
+        printf '  ║  %s[9]%s 更新 Realm%23s║\n' "$GREEN" "$BLUE" ''
+        printf '  ║  %s[10]%s 更新管理脚本%20s║\n' "$GREEN" "$BLUE" ''
+        printf '  ║  %s[11]%s 一键卸载%24s║\n' "$GREEN" "$BLUE" ''
+        printf '  ║  %s[0]%s 退出脚本%25s║\n' "$GREEN" "$BLUE" ''
+        printf '  ╚═══════════════════════════════════════╝%s\n\n' "$NC"
         MENU_INTERRUPTED=0
         if ! read -r -p '  请输入选项 [0-11]: ' choice; then
             if (( MENU_INTERRUPTED )); then pause_menu; continue; fi
