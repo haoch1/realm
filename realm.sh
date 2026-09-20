@@ -1,5 +1,5 @@
 #!/bin/sh
-# Realm 端口转发管理。首次添加规则时安装最新版；r --update 更新核心。
+# Realm 端口转发管理。首次需要核心时安装最新版；r --update 安装或更新核心。
 
 # POSIX 启动段：Alpine 没有 Bash 时先安装，再交给 Bash 运行。
 install_packages() {
@@ -29,8 +29,9 @@ if [ -z "${BASH_VERSION:-}" ]; then
 fi
 
 DIR=/root/realm
-SCRIPT_VERSION=1.2.3
-BIN=$DIR/realm
+SCRIPT_VERSION=1.3.0
+MANAGED_BIN=$DIR/realm
+BIN=$MANAGED_BIN
 CONF=$DIR/config.json
 UNIT=/etc/systemd/system/realm.service
 INIT=systemd
@@ -83,6 +84,40 @@ version() {
         printf '无法识别版本输出：%s\n' "$output" >&2
         return 1
     fi
+}
+
+configured_core() {
+    local path=''
+    if [[ $INIT == systemd && -f $UNIT ]]; then
+        path=$(sed -n 's/^ExecStart=\([^[:space:]]*\).*/\1/p' "$UNIT" | head -n 1)
+    elif [[ $INIT == openrc && -f $UNIT ]]; then
+        path=$(sed -n 's/^command="\([^"]*\)".*/\1/p' "$UNIT" | head -n 1)
+    fi
+    [[ $path == /* && -x $path ]] || return 1
+    printf '%s\n' "$path"
+}
+
+resolve_core() {
+    local candidate discovered=''
+    if discovered=$(configured_core 2>/dev/null); then
+        BIN=$discovered
+        return 0
+    fi
+    [[ -x $BIN ]] && return 0
+    if discovered=$(command -v realm 2>/dev/null); then
+        if [[ $discovered == /* && -x $discovered ]]; then
+            BIN=$discovered
+            return 0
+        fi
+    fi
+    for candidate in /usr/local/bin/realm /usr/bin/realm /usr/local/sbin/realm /usr/sbin/realm; do
+        if [[ -x $candidate ]]; then
+            BIN=$candidate
+            return 0
+        fi
+    done
+    BIN=$MANAGED_BIN
+    return 1
 }
 
 dependencies() {
@@ -157,7 +192,7 @@ acquire_lock() {
             fi
             sleep 0.1
         done
-        fail "旧端口转发脚本仍在执行操作，请稍后重试（PID: $holder）"
+        fail "旧管理脚本仍在执行操作，请稍后重试（PID: $holder）"
         return 1
     fi
 
@@ -309,6 +344,7 @@ ready() {
 
 service_state() {
     local result=$1 value
+    resolve_core >/dev/null 2>&1 || true
     if [[ ! -x $BIN ]]; then
         value='未安装'
     elif svc active 2>/dev/null; then
@@ -321,6 +357,7 @@ service_state() {
 
 core_version() {
     local result=$1 value
+    resolve_core >/dev/null 2>&1 || true
     if [[ ! -x $BIN ]]; then
         value='未安装'
     elif value=$(version "$BIN" 2>/dev/null); then
@@ -331,6 +368,19 @@ core_version() {
     printf -v "$result" '%s' "$value"
 }
 
+ensure_core() {
+    resolve_core >/dev/null 2>&1 || true
+    if [[ -x $BIN ]] && version "$BIN" >/dev/null 2>&1; then
+        return 0
+    fi
+    update_realm || return 1
+    resolve_core >/dev/null 2>&1 || true
+    [[ -x $BIN ]] && version "$BIN" >/dev/null 2>&1 || {
+        fail 'Realm 核心安装失败'
+        return 1
+    }
+}
+
 rule_count() {
     jq -er '.endpoints | length' "$CONF"
 }
@@ -339,6 +389,7 @@ start_realm() {
     local count was_enabled=0
     count=$(rule_count) || return 1
     (( count )) || { warn '暂无转发规则，无法启动 Realm'; return 1; }
+    ensure_core || return 1
     svc enabled 2>/dev/null && was_enabled=1
     if [[ ! -f $UNIT ]]; then
         write_unit || { fail 'Realm 服务配置创建失败'; return 1; }
@@ -386,6 +437,7 @@ restart_realm() {
     local count
     count=$(rule_count) || return 1
     (( count )) || { warn '暂无转发规则，无法重启 Realm'; return 1; }
+    ensure_core || return 1
     if [[ ! -f $UNIT ]]; then
         write_unit || { fail 'Realm 服务配置创建失败'; return 1; }
     fi
@@ -400,6 +452,7 @@ restart_realm() {
 
 update_realm() (
     local temp active=0 replaced=0 had=0 status interrupted=0 sum member current current_display
+    resolve_core >/dev/null 2>&1 || true
     temp=$(mktemp -d "$DIR/.download.XXXXXX") || exit 1
     cleanup() {
         status=$?
@@ -451,10 +504,14 @@ update_realm() (
         exit 1
     }
     [[ $current == "${TAG#v}" ]] || { fail "版本不匹配：期望 ${TAG#v}，实际 $current"; exit 1; }
-    if [[ -f $BIN ]]; then cp -p "$BIN" "$temp/old" && cp -p "$BIN" "$BIN.bak" || exit 1; had=1; fi
+    if [[ -f $BIN ]]; then
+        cp -p "$BIN" "$temp/old" || exit 1
+        if [[ $BIN == "$MANAGED_BIN" ]]; then cp -p "$BIN" "$BIN.bak" || exit 1; fi
+        had=1
+    fi
     if svc active; then active=1; fi
     replaced=1
-    mv -f "$temp/realm" "$BIN" || exit 1
+    mkdir -p "${BIN%/*}" && mv -f "$temp/realm" "$BIN" || exit 1
     if (( active )); then svc restart && ready || exit 1; fi
     replaced=0
     printf '  Realm 已更新至 %s\n' "$TAG"
@@ -466,32 +523,32 @@ update_script() (
     trap 'rm -f -- "$temp"' EXIT
     trap interrupt_exit INT
     trap 'exit 143' TERM HUP
-    printf '  正在获取最新端口转发脚本版本...\n'
-    get "${SCRIPT_URL}?v=$$-$RANDOM" "$temp" || { fail '端口转发脚本下载失败，请检查 GitHub 连接'; exit 1; }
+    printf '  正在获取最新管理脚本版本...\n'
+    get "${SCRIPT_URL}?v=$$-$RANDOM" "$temp" || { fail '管理脚本下载失败，请检查 GitHub 连接'; exit 1; }
     IFS= read -r first_line < "$temp" || true
-    [[ $first_line == '#!/bin/sh' ]] || { fail '下载内容不是有效的端口转发脚本'; exit 1; }
-    bash -n "$temp" || { fail '新版端口转发脚本语法检查失败，未替换当前版本'; exit 1; }
+    [[ $first_line == '#!/bin/sh' ]] || { fail '下载内容不是有效的管理脚本'; exit 1; }
+    bash -n "$temp" || { fail '新版管理脚本语法检查失败，未替换当前版本'; exit 1; }
     new_version=$(sed -n 's/^SCRIPT_VERSION=\([0-9][0-9.]*\)$/\1/p' "$temp")
-    [[ $new_version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { fail '新版端口转发脚本缺少有效版本号'; exit 1; }
+    [[ $new_version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { fail '新版管理脚本缺少有效版本号'; exit 1; }
     printf '  当前版本: v%s → 最新版本: v%s\n' "$SCRIPT_VERSION" "$new_version"
     if [[ -f $RT ]]; then
         new_hash=$(sha256sum "$temp") || exit 1
         old_hash=$(sha256sum "$RT") || exit 1
         if [[ ${new_hash%% *} == "${old_hash%% *}" ]]; then
-            printf '  端口转发脚本已是最新版\n'
+            printf '  管理脚本已是最新版\n'
             exit 0
         fi
     fi
-    chmod 755 "$temp" && mv -f "$temp" "$RT" || { fail '端口转发脚本替换失败'; exit 1; }
+    chmod 755 "$temp" && mv -f "$temp" "$RT" || { fail '管理脚本替换失败'; exit 1; }
     trap - EXIT INT TERM HUP
-    printf '  端口转发脚本已更新至 v%s\n' "$new_version"
+    printf '  管理脚本已更新至 v%s\n' "$new_version"
 )
 
 reload_script() {
     trap - INT TERM HUP
     exec 9>&-
     exec bash "$RT"
-    fail '无法重新加载端口转发脚本，请重新运行 r'
+    fail '无法重新加载管理脚本，请重新运行 r'
 }
 
 valid_port() { [[ $1 =~ ^[0-9]{1,5}$ ]] && (( 10#$1 > 0 && 10#$1 < 65536 )); }
@@ -601,8 +658,8 @@ apply_rules() (
     trap interrupt_exit INT
     trap 'exit 143' TERM HUP
     count=$(jq -er '.endpoints | length' "$candidate") || exit 1
-    if (( count )) && { [[ ! -x $BIN ]] || ! version "$BIN" >/dev/null 2>&1; }; then
-        update_realm
+    if (( count )); then
+        ensure_core
         status=$?
         (( status == 130 )) && exit 130
         (( status == 0 )) || exit 1
@@ -797,7 +854,7 @@ delete_rules() {
         if (( count == 0 )); then warn '暂无转发规则'; return 0; fi
         printf '\n'
         warn "确认清空全部 ${count} 条端口转发规则？"
-        read_input answer '  (y/N): ' || return 1
+        read_input answer '  (Y/N): ' || return 1
         [[ $answer == y || $answer == Y ]] || { MENU_CANCELLED=1; return 1; }
     else
         selected_port=$(jq -r --argjson i "$index" '.endpoints[$i].listen | split(":") | last' "$CONF") || return 1
@@ -822,7 +879,7 @@ uninstall() {
     info '=== 一键卸载 Realm ==='
     printf '\n'
     warn '卸载将删除 Realm、全部规则和备份，是否继续？'
-    read_input answer '  (y/N): ' || return 1
+    read_input answer '  (Y/N): ' || return 1
     [[ $answer == y || $answer == Y ]] || { MENU_CANCELLED=1; return 1; }
     check_service || return 1
     if [[ -f $UNIT ]] || svc active; then svc stop >/dev/null 2>&1 || { fail '停止服务失败，未删除文件'; return 1; }; fi
@@ -861,12 +918,12 @@ menu() {
             *) core_width=${#core} ;;
         esac
         core_pad=$((23-core_width)); (( core_pad > 0 )) || core_pad=1
-        script_pad=$((20-${#SCRIPT_VERSION})); (( script_pad > 0 )) || script_pad=1
+        script_pad=$((24-${#SCRIPT_VERSION})); (( script_pad > 0 )) || script_pad=1
         printf '\n%s  ╔═══════════════════════════════════════╗\n' "$BLUE"
         printf '  ║    端口转发管理（当前规则：%s%s%s 条）%*s║\n' "$GREEN" "$count" "$BLUE" "$header_pad" ''
         printf '  ║    Realm 状态：%s%s%s%*s║\n' "$GREEN" "$state" "$BLUE" "$state_pad" ''
         printf '  ║    Realm 版本：%s%s%s%*s║\n' "$GREEN" "$core" "$BLUE" "$core_pad" ''
-        printf '  ║    端口转发脚本：%sv%s%s%*s║\n' "$GREEN" "$SCRIPT_VERSION" "$BLUE" "$script_pad" ''
+        printf '  ║    管理脚本：%sv%s%s%*s║\n' "$GREEN" "$SCRIPT_VERSION" "$BLUE" "$script_pad" ''
         printf '  ╠═══════════════════════════════════════╣\n'
         printf '  ║  %s基础功能%29s║\n' "$BLUE" ''
         printf '  ║  %s[1]%s  添加转发规则%20s║\n' "$GREEN" "$BLUE" ''
@@ -881,8 +938,8 @@ menu() {
         printf '  ║  %s[8]%s  重启 Realm%22s║\n' "$GREEN" "$BLUE" ''
         printf '  ║%39s║\n' ''
         printf '  ║  %s更新与卸载%27s║\n' "$BLUE" ''
-        printf '  ║  %s[9]%s  更新 Realm%22s║\n' "$GREEN" "$BLUE" ''
-        printf '  ║  %s[10]%s 更新端口转发脚本%16s║\n' "$GREEN" "$BLUE" ''
+        printf '  ║  %s[9]%s  安装/更新 Realm%17s║\n' "$GREEN" "$BLUE" ''
+        printf '  ║  %s[10]%s 更新管理脚本%20s║\n' "$GREEN" "$BLUE" ''
         printf '  ║  %s[11]%s 一键卸载%24s║\n' "$GREEN" "$BLUE" ''
         printf '  ║%39s║\n' ''
         printf '  ║  %s[0]%s  退出脚本%24s║\n' "$GREEN" "$BLUE" ''
@@ -900,9 +957,9 @@ menu() {
             6) printf '\n'; info '=== 启动 Realm ==='; printf '\n'; run_menu_action start_realm || true ;;
             7) printf '\n'; info '=== 停止 Realm ==='; printf '\n'; run_menu_action stop_realm || true ;;
             8) printf '\n'; info '=== 重启 Realm ==='; printf '\n'; run_menu_action restart_realm || true ;;
-            9) printf '\n'; info '=== 更新 Realm ==='; printf '\n'; run_menu_action update_realm || true ;;
+            9) printf '\n'; info '=== 安装/更新 Realm ==='; printf '\n'; run_menu_action update_realm || true ;;
             10)
-                printf '\n'; info '=== 更新端口转发脚本 ==='; printf '\n'
+                printf '\n'; info '=== 更新管理脚本 ==='; printf '\n'
                 if run_menu_action update_script; then
                     pause_enter '  按回车加载最新脚本...'
                     (( INPUT_EOF )) && return 0
@@ -922,8 +979,8 @@ menu() {
 main() {
     local command=${0##*/}
     case "${1:-}" in
-        -v|--version) printf 'Realm 端口转发脚本 v%s\n' "$SCRIPT_VERSION"; return 0 ;;
-        -h|--help) printf '用法：%s [--update|--update-script|--uninstall|--version]\n不带参数打开管理菜单；--update 更新 Realm；--update-script 更新端口转发脚本；--uninstall 卸载并清理全部规则；--version 查看端口转发脚本版本\n' "$command"; return 0 ;;
+        -v|--version) printf 'Realm 管理脚本 v%s\n' "$SCRIPT_VERSION"; return 0 ;;
+        -h|--help) printf '用法：%s [--update|--update-script|--uninstall|--version]\n不带参数打开管理菜单；--update 安装/更新 Realm；--update-script 更新管理脚本；--uninstall 卸载并清理全部规则；--version 查看管理脚本版本\n' "$command"; return 0 ;;
         ''|--update|--update-script|--uninstall) ;;
         *) fail "用法：$command [--update|--update-script|--uninstall|--version]"; return 1 ;;
     esac
@@ -937,6 +994,7 @@ main() {
     acquire_lock || return 1
     trap 'exit 0' TERM HUP
     if [[ ${1:-} == --update-script ]]; then update_script && reload_script; return; fi
+    resolve_core >/dev/null 2>&1 || true
     check_service || return 1
     if [[ ${1:-} == --uninstall ]]; then uninstall; return; fi
     mkdir -p "$DIR" && init_config || return 1
