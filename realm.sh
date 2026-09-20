@@ -29,7 +29,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
 fi
 
 DIR=/root/realm
-SCRIPT_VERSION=1.0.1
+SCRIPT_VERSION=1.0.2
 MANAGED_BIN=$DIR/realm
 BIN=$MANAGED_BIN
 SYSTEM_REALM=''
@@ -144,9 +144,9 @@ version() {
 configured_core() {
     local path=''
     if [[ $INIT == systemd && -f $UNIT ]]; then
-        path=$(sed -n 's/^ExecStart=\([^[:space:]]*\).*/\1/p' "$UNIT" | head -n 1)
+        path=$(awk '/^ExecStart=/{sub(/^ExecStart=/, ""); sub(/[[:space:]].*$/, ""); print; exit}' "$UNIT")
     elif [[ $INIT == openrc && -f $UNIT ]]; then
-        path=$(sed -n 's/^command="\([^"]*\)".*/\1/p' "$UNIT" | head -n 1)
+        path=$(awk -F'"' '/^command=/{print $2; exit}' "$UNIT")
     fi
     [[ $path == /* && -x $path ]] || return 1
     printf '%s\n' "$path"
@@ -156,14 +156,14 @@ service_command() {
     local command=''
     if [[ $INIT == systemd ]]; then
         if [[ -f $UNIT ]]; then
-            command=$(sed -n 's/^ExecStart=//p' "$UNIT" | head -n 1)
+            command=$(awk '/^ExecStart=/{sub(/^ExecStart=/, ""); print; exit}' "$UNIT")
         else
             command=$(systemctl show realm -p ExecStart --value 2>/dev/null || true)
         fi
     elif [[ -f $UNIT ]]; then
         local path args
-        path=$(sed -n 's/^command="\([^"]*\)".*/\1/p' "$UNIT" | head -n 1)
-        args=$(sed -n 's/^command_args="\([^"]*\)".*/\1/p' "$UNIT" | head -n 1)
+        path=$(awk -F'"' '/^command=/{print $2; exit}' "$UNIT")
+        args=$(awk -F'"' '/^command_args=/{print $2; exit}' "$UNIT")
         [[ -n $path ]] && command="$path${args:+ $args}"
     fi
     printf '%s\n' "$command"
