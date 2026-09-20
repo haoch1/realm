@@ -29,7 +29,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
 fi
 
 DIR=/root/realm
-SCRIPT_VERSION=1.4.0
+SCRIPT_VERSION=1.4.1
 MANAGED_BIN=$DIR/realm
 BIN=$MANAGED_BIN
 CONF=$DIR/config.json
@@ -53,6 +53,13 @@ info() { printf '  %s[信息] %s%s\n' "$BLUE" "$*" "$NC"; }
 warn() { printf '  %s[注意] %s%s\n' "$YELLOW" "$*" "$NC"; }
 success() { printf '  %s[成功] %s%s\n' "$GREEN" "$*" "$NC"; }
 interrupt_exit() { printf '\n'; exit 130; }
+
+clear_terminal() {
+    [[ -t 1 ]] || return 0
+    command -v clear >/dev/null 2>&1 && clear 2>/dev/null || true
+    printf '\033[3J\033[2J\033[H\033[0m'
+}
+
 read_input() {
     local destination=$1 prompt=$2 reply='' status=0
     read -r -p "$prompt" reply || status=$?
@@ -451,7 +458,7 @@ restart_realm() {
 }
 
 update_realm() (
-    local temp active=0 replaced=0 had=0 status interrupted=0 sum member current current_display
+    local temp active=0 replaced=0 had=0 status interrupted=0 sum member current
     resolve_core >/dev/null 2>&1 || true
     temp=$(mktemp -d "$DIR/.download.XXXXXX") || exit 1
     cleanup() {
@@ -482,14 +489,6 @@ update_realm() (
         fail '获取最新版本失败，请检查 GitHub 访问或 API 限流'; exit 1;
     }
     current=$(version "$BIN" 2>/dev/null) || current=''
-    if [[ -n $current ]]; then
-        current_display="v$current"
-    elif [[ -x $BIN ]]; then
-        current_display='未知'
-    else
-        current_display='未安装'
-    fi
-    info "Realm 核心当前版本: $current_display → 最新版本: $TAG"
     [[ $current != "${TAG#v}" ]] || { info "Realm 核心已是最新版本 $TAG"; exit 0; }
     get "$URL" "$temp/package.tar.gz" || exit 1
     sum=$(sha256sum "$temp/package.tar.gz") || exit 1
@@ -534,7 +533,6 @@ update_script() (
     bash -n "$temp" || { fail '新版管理脚本语法检查失败，未替换当前版本'; exit 1; }
     new_version=$(sed -n 's/^SCRIPT_VERSION=\([0-9][0-9.]*\)$/\1/p' "$temp")
     [[ $new_version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { fail '新版管理脚本缺少有效版本号'; exit 1; }
-    info "管理脚本当前版本: v$SCRIPT_VERSION → 最新版本: v$new_version"
     if [[ -f $RT ]]; then
         new_hash=$(sha256sum "$temp") || exit 1
         old_hash=$(sha256sum "$RT") || exit 1
@@ -914,7 +912,7 @@ menu() {
     MENU_CANCELLED=0 INPUT_EOF=0
     while true; do
         MENU_CANCELLED=0 INPUT_EOF=0
-        [[ -t 1 ]] && printf '\033[2J\033[H'
+        clear_terminal
         count=$(jq '.endpoints|length' "$CONF") || return 1
         service_state state
         core_version core
@@ -967,7 +965,6 @@ menu() {
             8) printf '\n'; info '=== 重启 Realm ==='; printf '\n'; run_menu_action restart_realm || true ;;
             9) printf '\n'; run_menu_action update_realm_action || true ;;
             10)
-                printf '\n'; info '=== 更新管理脚本 ==='; printf '\n'
                 if run_menu_action update_management_script; then
                     pause_enter '  按回车加载最新脚本...'
                     (( INPUT_EOF )) && return 0
