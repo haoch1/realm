@@ -29,9 +29,10 @@ if [ -z "${BASH_VERSION:-}" ]; then
 fi
 
 DIR=/root/realm
-SCRIPT_VERSION=1.0.0
+SCRIPT_VERSION=1.0.1
 MANAGED_BIN=$DIR/realm
 BIN=$MANAGED_BIN
+SYSTEM_REALM=''
 CONF=$DIR/config.json
 UNIT=/etc/systemd/system/realm.service
 INIT=systemd
@@ -151,26 +152,60 @@ configured_core() {
     printf '%s\n' "$path"
 }
 
+service_command() {
+    local command=''
+    if [[ $INIT == systemd ]]; then
+        if [[ -f $UNIT ]]; then
+            command=$(sed -n 's/^ExecStart=//p' "$UNIT" | head -n 1)
+        else
+            command=$(systemctl show realm -p ExecStart --value 2>/dev/null || true)
+        fi
+    elif [[ -f $UNIT ]]; then
+        local path args
+        path=$(sed -n 's/^command="\([^"]*\)".*/\1/p' "$UNIT" | head -n 1)
+        args=$(sed -n 's/^command_args="\([^"]*\)".*/\1/p' "$UNIT" | head -n 1)
+        [[ -n $path ]] && command="$path${args:+ $args}"
+    fi
+    printf '%s\n' "$command"
+}
+
+service_config_path() {
+    local command=$1 path=''
+    if [[ $command =~ (^|[[:space:]])-c[[:space:]]+([^[:space:];]+) ]]; then
+        path=${BASH_REMATCH[2]}
+    fi
+    printf '%s\n' "$path"
+}
+
+foreign_service() {
+    local command=$1 path
+    path=$(service_config_path "$command")
+    if [[ -n $path && $path != "$CONF" ]]; then
+        fail '检测到现有 Realm 服务使用其他配置文件：'
+        printf '  %s\n' "$path"
+    else
+        fail '检测到现有 Realm 服务使用外部 Realm 核心或其他启动方式'
+        printf '  配置文件：%s\n' "${path:-未识别}"
+    fi
+    printf '  为避免覆盖现有转发规则，本脚本不会自动接管\n'
+    return 1
+}
+
 resolve_core() {
     local candidate discovered=''
-    if discovered=$(configured_core 2>/dev/null); then
-        BIN=$discovered
-        return 0
-    fi
+    BIN=$MANAGED_BIN
+    SYSTEM_REALM=''
     [[ -x $BIN ]] && return 0
-    if discovered=$(command -v realm 2>/dev/null); then
-        if [[ $discovered == /* && -x $discovered ]]; then
-            BIN=$discovered
-            return 0
-        fi
+    if discovered=$(configured_core 2>/dev/null); then
+        [[ $discovered != "$MANAGED_BIN" && -x $discovered ]] && SYSTEM_REALM=$discovered
+    fi
+    if [[ -z $SYSTEM_REALM ]] && discovered=$(command -v realm 2>/dev/null); then
+        [[ $discovered != "$MANAGED_BIN" && $discovered == /* && -x $discovered ]] && SYSTEM_REALM=$discovered
     fi
     for candidate in /usr/local/bin/realm /usr/bin/realm /usr/local/sbin/realm /usr/sbin/realm; do
-        if [[ -x $candidate ]]; then
-            BIN=$candidate
-            return 0
-        fi
+        [[ -n $SYSTEM_REALM ]] && break
+        [[ $candidate != "$MANAGED_BIN" && -x $candidate ]] && SYSTEM_REALM=$candidate
     done
-    BIN=$MANAGED_BIN
     return 1
 }
 
@@ -291,17 +326,29 @@ svc() {
 } 9>&-
 
 check_service() {
-    local path command
+    local path command config_path
     if [[ $INIT == openrc ]]; then
-        [[ ! -f $UNIT ]] || { grep -Fxq "command=\"$BIN\"" "$UNIT" && grep -Fxq "command_args=\"-c $CONF\"" "$UNIT"; } ||
-            { fail '发现其他配置的 Realm OpenRC 服务，不能直接接管'; return 1; }
+        [[ ! -f $UNIT ]] && return 0
+        command=$(service_command)
+        [[ "$command" == "$MANAGED_BIN -c $CONF" ]] || {
+            foreign_service "$command"
+            return 1
+        }
         return 0
     fi
-    path=$(systemctl show realm -p FragmentPath --value) || return 1
+    path=$(systemctl show realm -p FragmentPath --value 2>/dev/null) || return 1
     [[ -z $path ]] && return 0
-    command=$(systemctl show realm -p ExecStart --value) || return 1
-    [[ $path == "$UNIT" && $command == *"$BIN -c $DIR/config."* ]] ||
-        fail '发现其他路径的 realm 服务，不能直接接管'
+    command=$(service_command)
+    config_path=$(service_config_path "$command")
+    if [[ $path == "$UNIT" && "$command" == "$MANAGED_BIN -c $CONF" ]]; then
+        return 0
+    fi
+    if [[ -n $config_path ]]; then
+        foreign_service "$command"
+    else
+        fail '检测到现有 Realm 服务，但无法确认其配置文件，本脚本不会自动接管'
+    fi
+    return 1
 }
 
 write_unit() {
@@ -413,10 +460,14 @@ service_state() {
 }
 
 core_version() {
-    local result=$1 value
+    local result=$1 value external_version
     resolve_core >/dev/null 2>&1 || true
     if [[ ! -x $BIN ]]; then
-        value='未安装'
+        if [[ -n $SYSTEM_REALM ]] && external_version=$(version "$SYSTEM_REALM" 2>/dev/null); then
+            value="外部 v$external_version"
+        else
+            value='未安装'
+        fi
     elif value=$(version "$BIN" 2>/dev/null); then
         value="v$value"
     else
@@ -688,6 +739,8 @@ show_resolution() {
 apply_rules() (
     local candidate=$1 temp active=0 had_unit=0 changed=0 enabled=0 status interrupted=0 count
     temp=$(mktemp -d "$DIR/.change.XXXXXX") || exit 1
+    if svc active 2>/dev/null; then active=1; fi
+    if svc enabled 2>/dev/null; then enabled=1; fi
     rollback() {
         status=$?
         (( status == 130 )) && interrupted=1
@@ -698,11 +751,11 @@ apply_rules() (
             if (( enabled == 0 )); then svc disable >/dev/null 2>&1 || true; fi
             cp -p "$temp/config" "$CONF" || fail '恢复旧配置失败'
             if (( had_unit )); then cp -p "$temp/unit" "$UNIT"; else rm -f "$UNIT"; fi
-            svc reload || true
+            svc reload >/dev/null 2>&1 || true
             if (( enabled )); then svc enable >/dev/null 2>&1 || true; fi
             if (( active )); then
                 svc reset >/dev/null 2>&1 || true
-                svc restart && ready || fail '恢复旧服务失败'
+                svc restart >/dev/null 2>&1 && ready || fail '恢复旧服务失败'
             fi
             fail '修改未生效，已尝试恢复原规则'
             (( interrupted )) || status=1
@@ -714,22 +767,23 @@ apply_rules() (
     trap interrupt_exit INT
     trap 'exit 143' TERM HUP
     count=$(jq -er '.endpoints | length' "$candidate") || exit 1
+    cp -p "$CONF" "$temp/config" && cp -p "$CONF" "$CONF.bak" || exit 1
+    if [[ -f $UNIT ]]; then cp -p "$UNIT" "$temp/unit" || exit 1; had_unit=1; fi
     if (( count )); then
         ensure_core
         status=$?
         (( status == 130 )) && exit 130
         (( status == 0 )) || exit 1
     fi
-    cp -p "$CONF" "$temp/config" && cp -p "$CONF" "$CONF.bak" || exit 1
-    if [[ -f $UNIT ]]; then cp -p "$UNIT" "$temp/unit" || exit 1; had_unit=1; fi
-    if svc active; then active=1; fi
-    if svc enabled 2>/dev/null; then enabled=1; fi
     changed=1
     chmod 600 "$candidate" && mv -f "$candidate" "$CONF" || exit 1
     if (( count )); then
-        write_unit && svc enable >/dev/null 2>&1 && svc restart >/dev/null 2>&1 && ready || exit 1
+        write_unit || exit 1
+        if (( active )); then
+            svc restart >/dev/null 2>&1 && ready || exit 1
+        fi
     elif (( had_unit )); then
-        svc stop >/dev/null 2>&1 || exit 1
+        if (( active )); then svc stop >/dev/null 2>&1 || exit 1; fi
         if (( enabled )); then svc disable >/dev/null 2>&1 || exit 1; fi
     fi
     changed=0
@@ -944,7 +998,9 @@ uninstall() {
     rm -f -- "$UNIT" "$UNIT.bak" "$startup" || return 1
     svc reload >/dev/null 2>&1 || return 1
     rm -f -- "${RT%/*}"/.realm-manager.?????? || return 1
-    rm -rf -- "$DIR" || return 1
+    rm -f -- "$CONF" "$CONF.bak" "$MANAGED_BIN" "$MANAGED_BIN.bak" || return 1
+    rm -rf -- "$DIR"/.download.?????? "$DIR"/.change.?????? "$DIR"/.rules.?????? || return 1
+    rmdir "$DIR" 2>/dev/null || true
     rm -f -- "$LOG" "$LOG".* "$RT" "$LOCK" || return 1
     printf '  卸载完成：服务、核心、规则、备份、独立日志和 r 命令已清理\n'
 }
