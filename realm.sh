@@ -29,7 +29,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
 fi
 
 DIR=/root/realm
-SCRIPT_VERSION=1.4.1
+SCRIPT_VERSION=1.0.0
 MANAGED_BIN=$DIR/realm
 BIN=$MANAGED_BIN
 CONF=$DIR/config.json
@@ -38,6 +38,10 @@ INIT=systemd
 RUNLEVEL=/etc/runlevels/default
 RT=/usr/local/bin/r
 LOG=/var/log/realm.log
+LOG_MAX_BYTES=10485760
+LOG_KEEP_BYTES=5242880
+LOG_ROTATIONS=3
+TEMP_RETENTION_MINUTES=1440
 LOCK=/run/lock/realm-manager.lock
 API=https://api.github.com/repos/zhboner/realm/releases/latest
 SCRIPT_URL=https://raw.githubusercontent.com/haoch1/realm/main/realm.sh
@@ -58,6 +62,49 @@ clear_terminal() {
     [[ -t 1 ]] || return 0
     command -v clear >/dev/null 2>&1 && clear 2>/dev/null || true
     printf '\033[3J\033[2J\033[H\033[0m'
+}
+
+file_size_bytes() {
+    local file=$1 size
+    size=$(stat -c '%s' "$file" 2>/dev/null || true)
+    if [[ $size =~ ^[0-9]+$ ]]; then
+        printf '%s' "$size"
+    else
+        wc -c < "$file" 2>/dev/null | tr -d '[:space:]' || printf '0'
+    fi
+}
+
+rotate_file_log() {
+    local file=$1 size temp index
+    [[ -f $file ]] || return 0
+    size=$(file_size_bytes "$file")
+    [[ $size =~ ^[0-9]+$ ]] || return 0
+    (( size > LOG_MAX_BYTES )) || return 0
+    rm -f -- "$file.$((LOG_ROTATIONS + 1))"
+    for (( index=LOG_ROTATIONS; index > 1; index-- )); do
+        [[ -e "$file.$((index - 1))" ]] && mv -f -- "$file.$((index - 1))" "$file.$index" 2>/dev/null || true
+    done
+    cp -p -- "$file" "$file.1" 2>/dev/null || return 0
+    temp=$(mktemp "${file}.trim.XXXXXX") || return 0
+    if tail -c "$LOG_KEEP_BYTES" "$file" > "$temp" 2>/dev/null && cat "$temp" > "$file"; then
+        chmod 640 "$file" 2>/dev/null || true
+    fi
+    rm -f -- "$temp"
+}
+
+cleanup_stale_temp_files() {
+    local directory=$1 pattern
+    shift
+    [[ -d $directory ]] || return 0
+    for pattern in "$@"; do
+        find "$directory" -mindepth 1 -maxdepth 1 -name "$pattern" -mmin +"$TEMP_RETENTION_MINUTES" -exec rm -rf -- {} + 2>/dev/null || true
+    done
+}
+
+maintenance_cleanup() {
+    [[ $INIT == systemd ]] || rotate_file_log "$LOG"
+    cleanup_stale_temp_files "$DIR" '.download.*' '.change.*' '.rules.*'
+    cleanup_stale_temp_files "${RT%/*}" '.realm-manager.*'
 }
 
 read_input() {
@@ -218,6 +265,9 @@ detect_init() {
 
 # 只抽象必要的服务动作；转发不使用 nftables、IP forwarding 或特权网络接口。
 svc() {
+    case "$1" in
+        start|restart) [[ $INIT == systemd ]] || rotate_file_log "$LOG" ;;
+    esac
     if [[ $INIT == systemd ]]; then
         case "$1" in
             active) systemctl is-active --quiet realm ;;
@@ -998,11 +1048,13 @@ main() {
     mkdir -p /run/lock || return 1
     acquire_lock || return 1
     trap 'exit 0' TERM HUP
+    mkdir -p "$DIR" || return 1
+    maintenance_cleanup
     if [[ ${1:-} == --update-script ]]; then update_management_script && reload_script; return; fi
     resolve_core >/dev/null 2>&1 || true
     check_service || return 1
     if [[ ${1:-} == --uninstall ]]; then uninstall; return; fi
-    mkdir -p "$DIR" && init_config || return 1
+    init_config || return 1
     if [[ ${1:-} == --update ]]; then
         update_realm_action
     else
