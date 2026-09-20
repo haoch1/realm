@@ -29,7 +29,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
 fi
 
 DIR=/root/realm
-SCRIPT_VERSION=1.3.0
+SCRIPT_VERSION=1.4.0
 MANAGED_BIN=$DIR/realm
 BIN=$MANAGED_BIN
 CONF=$DIR/config.json
@@ -373,7 +373,7 @@ ensure_core() {
     if [[ -x $BIN ]] && version "$BIN" >/dev/null 2>&1; then
         return 0
     fi
-    update_realm || return 1
+    update_realm_action || return 1
     resolve_core >/dev/null 2>&1 || true
     [[ -x $BIN ]] && version "$BIN" >/dev/null 2>&1 || {
         fail 'Realm 核心安装失败'
@@ -477,7 +477,7 @@ update_realm() (
     trap cleanup EXIT
     trap interrupt_exit INT
     trap 'exit 143' TERM HUP
-    printf '  正在获取最新 Realm 版本...\n'
+    info '正在检查 Realm 核心更新'
     get "$API" "$temp/release.json" && select_asset "$temp/release.json" "$(uname -m)" || {
         fail '获取最新版本失败，请检查 GitHub 访问或 API 限流'; exit 1;
     }
@@ -489,8 +489,8 @@ update_realm() (
     else
         current_display='未安装'
     fi
-    printf '  当前版本: %s → 最新版本: %s\n' "$current_display" "$TAG"
-    [[ $current != "${TAG#v}" ]] || { printf '  Realm 已是最新版\n'; exit 0; }
+    info "Realm 核心当前版本: $current_display → 最新版本: $TAG"
+    [[ $current != "${TAG#v}" ]] || { info "Realm 核心已是最新版本 $TAG"; exit 0; }
     get "$URL" "$temp/package.tar.gz" || exit 1
     sum=$(sha256sum "$temp/package.tar.gz") || exit 1
     [[ ${sum%% *} == "${HASH#sha256:}" ]] || { fail 'SHA256 校验失败'; exit 1; }
@@ -514,8 +514,12 @@ update_realm() (
     mkdir -p "${BIN%/*}" && mv -f "$temp/realm" "$BIN" || exit 1
     if (( active )); then svc restart && ready || exit 1; fi
     replaced=0
-    printf '  Realm 已更新至 %s\n' "$TAG"
+    success "Realm 核心已更新至 $TAG"
 )
+
+update_realm_action() {
+    update_realm || { fail 'Realm 核心更新失败'; return 1; }
+}
 
 update_script() (
     local temp first_line new_hash old_hash new_version
@@ -523,26 +527,30 @@ update_script() (
     trap 'rm -f -- "$temp"' EXIT
     trap interrupt_exit INT
     trap 'exit 143' TERM HUP
-    printf '  正在获取最新管理脚本版本...\n'
+    info '正在检查管理脚本更新'
     get "${SCRIPT_URL}?v=$$-$RANDOM" "$temp" || { fail '管理脚本下载失败，请检查 GitHub 连接'; exit 1; }
     IFS= read -r first_line < "$temp" || true
     [[ $first_line == '#!/bin/sh' ]] || { fail '下载内容不是有效的管理脚本'; exit 1; }
     bash -n "$temp" || { fail '新版管理脚本语法检查失败，未替换当前版本'; exit 1; }
     new_version=$(sed -n 's/^SCRIPT_VERSION=\([0-9][0-9.]*\)$/\1/p' "$temp")
     [[ $new_version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { fail '新版管理脚本缺少有效版本号'; exit 1; }
-    printf '  当前版本: v%s → 最新版本: v%s\n' "$SCRIPT_VERSION" "$new_version"
+    info "管理脚本当前版本: v$SCRIPT_VERSION → 最新版本: v$new_version"
     if [[ -f $RT ]]; then
         new_hash=$(sha256sum "$temp") || exit 1
         old_hash=$(sha256sum "$RT") || exit 1
         if [[ ${new_hash%% *} == "${old_hash%% *}" ]]; then
-            printf '  管理脚本已是最新版\n'
+            info "管理脚本已是最新版本 v$new_version"
             exit 0
         fi
     fi
     chmod 755 "$temp" && mv -f "$temp" "$RT" || { fail '管理脚本替换失败'; exit 1; }
     trap - EXIT INT TERM HUP
-    printf '  管理脚本已更新至 v%s\n' "$new_version"
+    success "管理脚本已更新至 v$new_version"
 )
+
+update_management_script() {
+    update_script || { fail '管理脚本更新失败'; return 1; }
+}
 
 reload_script() {
     trap - INT TERM HUP
@@ -957,10 +965,10 @@ menu() {
             6) printf '\n'; info '=== 启动 Realm ==='; printf '\n'; run_menu_action start_realm || true ;;
             7) printf '\n'; info '=== 停止 Realm ==='; printf '\n'; run_menu_action stop_realm || true ;;
             8) printf '\n'; info '=== 重启 Realm ==='; printf '\n'; run_menu_action restart_realm || true ;;
-            9) printf '\n'; info '=== 安装/更新 Realm ==='; printf '\n'; run_menu_action update_realm || true ;;
+            9) printf '\n'; run_menu_action update_realm_action || true ;;
             10)
                 printf '\n'; info '=== 更新管理脚本 ==='; printf '\n'
-                if run_menu_action update_script; then
+                if run_menu_action update_management_script; then
                     pause_enter '  按回车加载最新脚本...'
                     (( INPUT_EOF )) && return 0
                     reload_script
@@ -993,13 +1001,13 @@ main() {
     mkdir -p /run/lock || return 1
     acquire_lock || return 1
     trap 'exit 0' TERM HUP
-    if [[ ${1:-} == --update-script ]]; then update_script && reload_script; return; fi
+    if [[ ${1:-} == --update-script ]]; then update_management_script && reload_script; return; fi
     resolve_core >/dev/null 2>&1 || true
     check_service || return 1
     if [[ ${1:-} == --uninstall ]]; then uninstall; return; fi
     mkdir -p "$DIR" && init_config || return 1
     if [[ ${1:-} == --update ]]; then
-        update_realm
+        update_realm_action
     else
         menu
     fi
