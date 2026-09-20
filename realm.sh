@@ -934,16 +934,15 @@ uninstall() {
     printf '\n'
     info '=== 一键卸载 Realm ==='
     printf '\n'
-    warn '卸载将删除 Realm、全部规则和备份，是否继续？'
-    read_input answer '  (Y/N): ' || return 1
+    read_input answer "  ${YELLOW}[注意] 卸载将删除 Realm、全部规则和备份，是否继续？(Y/N): ${NC}" || return 1
     [[ $answer == y || $answer == Y ]] || { MENU_CANCELLED=1; return 1; }
     check_service || return 1
     if [[ -f $UNIT ]] || svc active; then svc stop >/dev/null 2>&1 || { fail '停止服务失败，未删除文件'; return 1; }; fi
-    if svc enabled 2>/dev/null; then svc disable || { fail '取消自启失败，未删除文件'; return 1; }; fi
+    if svc enabled 2>/dev/null; then svc disable >/dev/null 2>&1 || { fail '取消自启失败，未删除文件'; return 1; }; fi
     if svc active; then fail '服务仍在运行，未删除文件'; return 1; fi
     svc reset >/dev/null 2>&1 || true
     rm -f -- "$UNIT" "$UNIT.bak" "$startup" || return 1
-    svc reload || return 1
+    svc reload >/dev/null 2>&1 || return 1
     rm -f -- "${RT%/*}"/.realm-manager.?????? || return 1
     rm -rf -- "$DIR" || return 1
     rm -f -- "$LOG" "$LOG".* "$RT" "$LOCK" || return 1
