@@ -29,7 +29,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
 fi
 
 DIR=/root/realm
-SCRIPT_VERSION=1.0.2
+SCRIPT_VERSION=1.0.3
 MANAGED_BIN=$DIR/realm
 BIN=$MANAGED_BIN
 SYSTEM_REALM=''
