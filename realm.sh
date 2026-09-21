@@ -29,7 +29,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
 fi
 
 DIR=/root/realm
-SCRIPT_VERSION=1.0.3
+SCRIPT_VERSION=1.0.4
 MANAGED_BIN=$DIR/realm
 BIN=$MANAGED_BIN
 SYSTEM_REALM=''
@@ -1038,7 +1038,7 @@ menu() {
         printf '  ╠═══════════════════════════════════════╣\n'
         printf '  ║  %s基础功能%29s║\n' "$BLUE" ''
         printf '  ║  %s[1]%s  添加转发规则%20s║\n' "$GREEN" "$BLUE" ''
-        printf '  ║  %s[2]%s  查看当前转发规则%16s║\n' "$GREEN" "$BLUE" ''
+        printf '  ║  %s[2]%s  查看转发规则%20s║\n' "$GREEN" "$BLUE" ''
         printf '  ║  %s[3]%s  修改转发规则%20s║\n' "$GREEN" "$BLUE" ''
         printf '  ║  %s[4]%s  删除转发规则%20s║\n' "$GREEN" "$BLUE" ''
         printf '  ║  %s[5]%s  清空所有转发规则%16s║\n' "$GREEN" "$BLUE" ''
