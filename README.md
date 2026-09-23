@@ -2,7 +2,7 @@
 
 面向 Linux VPS 的轻量 Realm TCP/UDP 端口转发管理脚本，支持规则增删改查、服务管理、核心更新、脚本更新和一键卸载
 
-当前管理脚本版本为 `1.0.4`
+当前管理脚本版本为 `1.0.5`
 
 ## 功能
 
@@ -26,7 +26,7 @@
 (curl -LfsS https://raw.githubusercontent.com/haoch1/realm/main/realm.sh -o /usr/local/bin/r || wget -q https://raw.githubusercontent.com/haoch1/realm/main/realm.sh -O /usr/local/bin/r) && chmod +x /usr/local/bin/r && r
 ```
 
-脚本安装到 `/usr/local/bin/r`，配置和核心使用 Realm 原项目路径。打开菜单不会自动下载核心；首次添加规则、启动服务或选择核心更新时才会安装或更新 Realm
+脚本安装到 `/usr/local/bin/r`，配置和核心使用 Realm 原项目路径。打开菜单不会自动下载核心；首次添加规则、启动服务或选择核心更新时才会安装或更新 Realm。添加首条规则后会自动创建服务、开启开机自启并启动 Realm
 
 ## 管理菜单
 

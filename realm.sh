@@ -29,7 +29,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
 fi
 
 DIR=/root/realm
-SCRIPT_VERSION=1.0.4
+SCRIPT_VERSION=1.0.5
 MANAGED_BIN=$DIR/realm
 BIN=$MANAGED_BIN
 SYSTEM_REALM=''
@@ -781,6 +781,11 @@ apply_rules() (
         write_unit || exit 1
         if (( active )); then
             svc restart >/dev/null 2>&1 && ready || exit 1
+        else
+            if (( enabled == 0 )); then
+                svc enable >/dev/null 2>&1 || exit 1
+            fi
+            svc start >/dev/null 2>&1 && ready || exit 1
         fi
     elif (( had_unit )); then
         if (( active )); then svc stop >/dev/null 2>&1 || exit 1; fi
