@@ -95,11 +95,17 @@ rotate_file_log() {
 
 cleanup_stale_temp_files() {
     local directory=$1 pattern
+    local -a find_args
     shift
     [[ -d $directory ]] || return 0
+    (($#)) || return 0
+    find_args=("$directory" -mindepth 1 -maxdepth 1 -mmin "+$TEMP_RETENTION_MINUTES" \()
     for pattern in "$@"; do
-        find "$directory" -mindepth 1 -maxdepth 1 -name "$pattern" -mmin +"$TEMP_RETENTION_MINUTES" -exec rm -rf -- {} + 2>/dev/null || true
+        find_args+=(-name "$pattern" -o)
     done
+    # 末尾的 -false 使最后一个 -o 保持等价的短路表达式。
+    find_args+=(-false \) -exec rm -rf -- {} +)
+    find "${find_args[@]}" 2>/dev/null || true
 }
 
 maintenance_cleanup() {
@@ -424,7 +430,7 @@ select_asset() {
 }
 
 ready() {
-    local attempt pid sockets expected proto found port
+    local attempt pid expected found
     expected=$(jq -r "$JQ_PROTOCOL"'
         .network as $g | .endpoints[] | .listen as $listen
         | protocol($g) | if length==0 then error("规则未启用 TCP 或 UDP") else split("+")[] end
@@ -434,13 +440,33 @@ ready() {
         svc active || continue
         pid=$(svc pid) || continue
         [[ $pid =~ ^[1-9][0-9]*$ ]] || continue
-        sockets=$(ss -H -lntup) || continue
-        found=1
-        while IFS=$'\t' read -r proto port; do
-            [[ -n $proto ]] || continue
-            if ! awk -v proto="$proto" -v port="$port" -v pid="pid=$pid," \
-                '$1==proto && $5 ~ (":" port "$") && index($0,pid) {ok=1} END {exit !ok}' <<< "$sockets"; then found=0; break; fi
-        done <<< "$expected"
+        # 直接流式核对监听套接字，避免把完整 ss 输出复制到 Bash 变量，并合并重复的 awk 启动。
+        if ss -H -lntup | awk -v expected="$expected" -v pid="pid=$pid," '
+            BEGIN {
+                count = split(expected, lines, "\n")
+                required = 0
+                for (i = 1; i <= count; i++) {
+                    if (lines[i] == "") continue
+                    split(lines[i], fields, "\t")
+                    required++
+                    protocols[required] = fields[1]
+                    ports[required] = fields[2]
+                }
+            }
+            {
+                for (i = 1; i <= required; i++) {
+                    if ($1 == protocols[i] && $5 ~ (":" ports[i] "$") && index($0, pid)) {
+                        matched[i] = 1
+                    }
+                }
+            }
+            END {
+                for (i = 1; i <= required; i++) if (!(i in matched)) exit 1
+            }'; then
+            found=1
+        else
+            found=0
+        fi
         (( found )) && return 0
     done
     fail 'Realm 启动失败或端口未监听。systemd 查看 journalctl -u realm；OpenRC 查看 /var/log/realm.log'
