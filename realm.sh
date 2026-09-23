@@ -30,7 +30,7 @@ fi
 
 # 运行时路径与版本
 DIR=/root/realm
-SCRIPT_VERSION=1.0.5
+SCRIPT_VERSION=1.0.6
 MANAGED_BIN=$DIR/realm
 BIN=$MANAGED_BIN
 SYSTEM_REALM=''
@@ -146,7 +146,11 @@ pause_enter() {
     ((status != 0)) && INPUT_EOF=1
     return 0
 }
-get() { curl -fLsS --retry 2 --connect-timeout 15 --max-time 180 --proto '=https' --proto-redir '=https' "$1" -o "$2"; } 9>&-
+get() (
+    # 网络子进程不应继承管理锁，避免短暂下载进程延长锁的生命周期。
+    exec 9>&-
+    curl -fLsS --retry 2 --connect-timeout 15 --max-time 180 --proto '=https' --proto-redir '=https' "$1" -o "$2"
+)
 version() {
     local output
     output=$(timeout 10 "$1" --version 2>&1) || {
@@ -328,8 +332,9 @@ detect_init() {
 }
 
 # 只抽象必要的服务动作；转发不使用 nftables、IP forwarding 或特权网络接口。
-svc() {
-    # 函数尾部关闭 fd 9，避免服务子进程继承管理锁。
+svc() (
+    # 服务管理子进程不应继承管理锁，避免服务守护进程持锁阻塞下一次启动。
+    exec 9>&-
     case "$1" in
         start | restart) [[ $INIT == systemd ]] || rotate_file_log "$LOG" ;;
     esac
@@ -353,7 +358,7 @@ svc() {
             *) rc-service realm "$1" ;;
         esac
     fi
-} 9>&-
+)
 
 check_service() {
     local path command config_path
