@@ -1,32 +1,19 @@
 # realm
 
-面向 Linux VPS 的轻量 Realm TCP/UDP 端口转发管理脚本，支持规则增删改查、服务管理、核心更新、脚本更新和一键卸载
+面向 Linux VPS 的轻量 Realm TCP/UDP 端口转发管理脚本，支持规则管理、服务管理和核心更新
 
-当前管理脚本版本为 `1.0.5`
+当前管理脚本版本：`1.0.5`
 
 ## 功能
 
 - TCP、UDP 和 TCP+UDP 端口转发
-- 转发规则增删改查和清空
-- systemd、OpenRC 服务管理和开机自启
-- Realm 核心手动安装与更新
-- 管理脚本独立更新
+- 添加、查看、修改、删除和清空转发规则
+- 支持 systemd、OpenRC 服务管理及开机自启
+- Realm 核心安装更新和管理脚本更新
 - 配置校验、失败回滚和一键卸载
-- 仅管理 `/root/realm/realm`，系统已有的外部 Realm 核心不会被覆盖或删除
-- 修改规则会保持 Realm 原有的运行状态和开机自启状态；删除最后一条规则时会停止并关闭自启
-- Realm 风格单列菜单和统一更新提示
-- OpenRC/direct 日志超过 10 MiB 时自动保留最近 5 MiB，并最多保留 3 个轮转文件
-- 启动时清理超过 24 小时的更新临时文件，规则配置和备份不作为缓存删除
+- OpenRC 文件日志按需轮转，启动时清理过期临时文件
 
-## 实现约束与运行特性
-
-- 配置变更使用临时文件、备份、服务重启验证和失败回滚；修改前后的服务运行状态及开机自启状态按原流程恢复。
-- 命令行参数、菜单选项、交互提示、返回码、配置字段、服务单元路径和 Realm 核心接口保持兼容，不引入新的第三方依赖。
-- 同一目录下的临时文件清理合并为一次 `find` 遍历，减少启动时的目录扫描和外部进程开销；清理范围和 24 小时保留期限不变。
-- 服务就绪检查直接流式读取 `ss` 输出，并在一次 `awk` 扫描中核对全部监听端口，避免复制完整套接字列表和重复启动解析进程。
-- Realm 核心、管理脚本、配置、日志和锁文件的路径及卸载边界保持不变。优化仅作用于内部实现，不改变转发协议、服务管理策略或异常处理结果。
-
-## 一键安装
+## 安装
 
 使用 `root` 执行：
 
@@ -34,7 +21,7 @@
 (curl -LfsS https://raw.githubusercontent.com/haoch1/realm/main/realm.sh -o /usr/local/bin/r || wget -q https://raw.githubusercontent.com/haoch1/realm/main/realm.sh -O /usr/local/bin/r) && chmod +x /usr/local/bin/r && r
 ```
 
-脚本安装到 `/usr/local/bin/r`，配置和核心使用 Realm 原项目路径。打开菜单不会自动下载核心；首次添加规则、启动服务或选择核心更新时才会安装或更新 Realm。添加首条规则后会自动创建服务、开启开机自启并启动 Realm
+脚本安装到 `/usr/local/bin/r`，配置和核心使用 `/root/realm`。打开菜单不会自动下载核心，首次添加规则、启动服务或选择核心更新时才会安装或更新 Realm
 
 ## 管理菜单
 
@@ -64,40 +51,27 @@ Realm 版本：未安装
 [0]  退出脚本
 ```
 
-操作完成后按回车返回主菜单。核心和管理脚本更新完成后也会先等待回车，管理脚本更新确认后才加载新版本。输入 `q` 可取消当前输入，清空规则和卸载确认使用 `(Y/N)`，输入 `Y/y` 确认，输入 `N/n` 或直接回车取消
+操作完成后按回车返回主菜单。核心和管理脚本更新完成后也会等待回车，输入 `q` 可取消当前输入，清空规则和卸载确认使用 `(Y/N)`
 
-核心更新结果统一显示为：
+## 主要路径
 
-```text
-[信息] 正在检查 Realm 核心更新
-[信息] Realm 核心已是最新版本 vX.Y.Z
-[成功] Realm 核心已更新至 vX.Y.Z
-[错误] Realm 核心更新失败
-```
-
-管理脚本更新使用相同的检查中、已是最新、更新成功和更新失败格式
-
-## 文件路径
-
-| 文件 | 用途 |
+| 路径 | 用途 |
 | --- | --- |
 | `/usr/local/bin/r` | 管理脚本命令 |
 | `/root/realm/realm` | Realm 核心 |
 | `/root/realm/config.json` | 转发规则配置 |
 | `/etc/systemd/system/realm.service` | systemd 服务文件 |
 | `/etc/init.d/realm` | OpenRC 服务文件 |
-| `/var/log/realm.log` | OpenRC/direct 日志 |
+| `/var/log/realm.log` | OpenRC 日志 |
 
 ## 命令行
 
 ```sh
-r                 # 打开菜单
+r                 # 打开管理菜单
 r --update        # 安装或更新 Realm 核心
 r --update-script # 更新管理脚本
-r --version       # 查看脚本版本
-r --uninstall     # 卸载 Realm 和全部规则
+r --version       # 查看管理脚本版本
+r --uninstall     # 卸载 Realm 和转发规则
 ```
 
-一键卸载只清理 Realm 自身创建的服务、核心、配置、备份、日志、锁、临时文件和 `/usr/local/bin/r`
-
-systemd 使用系统 journald 管理日志，不修改全局 journal 配置；文件日志清理只作用于 `/var/log/realm.log` 及其轮转文件。
+一键卸载只清理 Realm 自身创建的服务、核心、配置、备份、日志、锁、临时文件和管理命令
