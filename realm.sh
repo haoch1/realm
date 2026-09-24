@@ -30,7 +30,7 @@ fi
 
 # 运行时路径与版本
 DIR=/root/realm
-SCRIPT_VERSION=1.0.7
+SCRIPT_VERSION=1.0.8
 MANAGED_BIN=$DIR/realm
 BIN=$MANAGED_BIN
 SYSTEM_REALM=''
@@ -120,7 +120,7 @@ cleanup_stale_temp_files() {
 
 maintenance_cleanup() {
     [[ $INIT == systemd ]] || rotate_file_log "$LOG"
-    cleanup_stale_temp_files "$DIR" '.download.*' '.change.*' '.rules.*' '.migration.*' '.migration-backup.*'
+    cleanup_stale_temp_files "$DIR" '.download.*' '.change.*' '.rules.*'
     cleanup_stale_temp_files "${RT%/*}" '.realm-manager.*'
 }
 
@@ -435,75 +435,9 @@ init_config() {
             fail '配置文件格式无效，请检查 /root/realm/config.json'
             return 1
         }
-        migrate_listen_addresses || return 1
         return 0
     fi
     printf '{"endpoints":[]}\n' >"$CONF"
-}
-
-migrate_listen_addresses() {
-    local candidate current_normalized new_normalized backup active=0
-    candidate=$(mktemp "$DIR/.migration.XXXXXX") || {
-        fail '无法创建配置迁移临时文件'
-        return 1
-    }
-    jq '
-        .endpoints |= map(
-            if (.listen | type) == "string" and (.listen | test("^0\\.0\\.0\\.0:[0-9]+$")) then
-                .listen = ("[::]:" + (.listen | split(":") | last))
-            else . end
-        )
-    ' "$CONF" >"$candidate" || {
-        rm -f "$candidate"
-        fail '旧配置迁移失败'
-        return 1
-    }
-    current_normalized=$(jq -cS . "$CONF") || {
-        rm -f "$candidate"
-        fail '旧配置读取失败'
-        return 1
-    }
-    new_normalized=$(jq -cS . "$candidate") || {
-        rm -f "$candidate"
-        fail '迁移后配置读取失败'
-        return 1
-    }
-    if [[ $current_normalized == "$new_normalized" ]]; then
-        rm -f "$candidate"
-        return 0
-    fi
-    backup=$(mktemp "$DIR/.migration-backup.XXXXXX") || {
-        rm -f "$candidate"
-        fail '旧配置备份失败'
-        return 1
-    }
-    cp -p "$CONF" "$backup" || {
-        rm -f "$candidate" "$backup"
-        fail '旧配置备份失败'
-        return 1
-    }
-    if svc active 2>/dev/null; then active=1; fi
-    if ((active)) && ! svc stop >/dev/null 2>&1; then
-        rm -f "$candidate" "$backup"
-        fail '无法停止服务，旧配置未迁移'
-        return 1
-    fi
-    if ! chmod 600 "$candidate" || ! mv -f "$candidate" "$CONF"; then
-        cp -p "$backup" "$CONF" 2>/dev/null || true
-        rm -f "$candidate" "$backup"
-        ((active)) && svc start >/dev/null 2>&1 || true
-        fail '迁移后的配置写入失败'
-        return 1
-    fi
-    if ((active)) && { ! svc start >/dev/null 2>&1 || ! ready; }; then
-        cp -p "$backup" "$CONF" 2>/dev/null || true
-        svc restart >/dev/null 2>&1 || true
-        rm -f "$backup"
-        fail '迁移后的配置启动失败，已恢复旧配置'
-        return 1
-    fi
-    rm -f "$backup"
-    info '已将旧规则迁移为双栈监听'
 }
 
 # 核心安装、服务就绪检查与更新
@@ -1271,7 +1205,7 @@ uninstall() {
     svc reload >/dev/null 2>&1 || return 1
     rm -f -- "${RT%/*}"/.realm-manager.?????? || return 1
     rm -f -- "$CONF" "$CONF.bak" "$MANAGED_BIN" "$MANAGED_BIN.bak" || return 1
-    rm -rf -- "$DIR"/.download.?????? "$DIR"/.change.?????? "$DIR"/.rules.?????? "$DIR"/.migration.?????? "$DIR"/.migration-backup.?????? || return 1
+    rm -rf -- "$DIR"/.download.?????? "$DIR"/.change.?????? "$DIR"/.rules.?????? || return 1
     rmdir "$DIR" 2>/dev/null || true
     rm -f -- "$LOG" "$LOG".* "$RT" "$LOCK" || return 1
     printf '  卸载完成：服务、核心、规则、备份、独立日志和 r 命令已清理\n'
