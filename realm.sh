@@ -1,15 +1,17 @@
 #!/bin/sh
-# Realm 端口转发管理。首次需要核心时安装最新版；r --update 安装或更新核心。
+# Realm 端口转发管理脚本
+# shellcheck shell=bash
 
-# POSIX 启动段：Alpine 没有 Bash 时先安装，再交给 Bash 运行。
+# === POSIX 启动引导 ===
+# Alpine 缺少 Bash 时先安装依赖，再由 Bash 执行管理逻辑
 install_packages() {
-    if command -v apk >/dev/null 2>&1; then
+    if command -v apk > /dev/null 2>&1; then
         apk add --no-cache bash ca-certificates curl jq tar coreutils flock iproute2-ss procps musl-utils
-    elif command -v apt-get >/dev/null 2>&1; then
+    elif command -v apt-get > /dev/null 2>&1; then
         apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y bash ca-certificates curl jq tar coreutils util-linux iproute2 procps libc-bin
-    elif command -v dnf >/dev/null 2>&1; then
+    elif command -v dnf > /dev/null 2>&1; then
         dnf install -y bash ca-certificates curl jq tar coreutils util-linux iproute procps-ng glibc-common
-    elif command -v yum >/dev/null 2>&1; then
+    elif command -v yum > /dev/null 2>&1; then
         yum install -y bash ca-certificates curl jq tar coreutils util-linux iproute procps-ng glibc-common
     else
         printf '无法识别包管理器，需要 apt-get、apk、dnf 或 yum\n' >&2
@@ -18,7 +20,7 @@ install_packages() {
 }
 
 if [ -z "${BASH_VERSION:-}" ]; then
-    if ! command -v bash >/dev/null 2>&1; then
+    if ! command -v bash > /dev/null 2>&1; then
         [ "$(uname -s)" = Linux ] && [ "$(id -u)" = 0 ] || {
             printf '请在 Linux 服务器上以 root 运行\n' >&2
             exit 1
@@ -28,14 +30,16 @@ if [ -z "${BASH_VERSION:-}" ]; then
     exec bash "$0" "$@"
 fi
 
-# 运行时路径与版本
+# === 运行时路径与版本 ===
 DIR=/root/realm
-SCRIPT_VERSION=1.0.8
+SCRIPT_VERSION=1.0.9
 MANAGED_BIN=$DIR/realm
 BIN=$MANAGED_BIN
 SYSTEM_REALM=''
 CONF=$DIR/config.json
-UNIT=/etc/systemd/system/realm.service
+SYSTEMD_UNIT=/etc/systemd/system/realm.service
+OPENRC_UNIT=/etc/init.d/realm
+UNIT=$SYSTEMD_UNIT
 INIT=systemd
 RUNLEVEL=/etc/runlevels/default
 RT=/usr/local/bin/r
@@ -48,20 +52,26 @@ LOCK=/run/lock/realm-manager.lock
 API=https://api.github.com/repos/zhboner/realm/releases/latest
 SCRIPT_URL=https://raw.githubusercontent.com/haoch1/realm/main/realm.sh
 BLUE=$'\033[1;36m' GREEN=$'\033[0;32m' RED=$'\033[0;31m' YELLOW=$'\033[0;33m' NC=$'\033[0m'
-# Endpoint 的非空设置覆盖全局值；显式 false 也必须保留。
+# Endpoint 的非空设置覆盖全局值；显式 false 也必须保留
 JQ_PROTOCOL='def protocol($global):
     ($global + ((.network // {}) | with_entries(select(.value != null)))) as $n
     | if $n.no_tcp == true then (if $n.use_udp == true then "udp" else "" end)
       elif $n.use_udp == true then "tcp+udp" else "tcp" end;'
 
-# 输出、信号与终端
+# === 输出、信号与终端 ===
 fail() {
     printf '  %s[错误] %s%s\n' "$RED" "$*" "$NC" >&2
     return 1
 }
-info() { printf '  %s[信息] %s%s\n' "$BLUE" "$*" "$NC"; }
-warn() { printf '  %s[注意] %s%s\n' "$YELLOW" "$*" "$NC"; }
-success() { printf '  %s[成功] %s%s\n' "$GREEN" "$*" "$NC"; }
+info() {
+    printf '  %s[信息] %s%s\n' "$BLUE" "$*" "$NC"
+}
+warn() {
+    printf '  %s[注意] %s%s\n' "$YELLOW" "$*" "$NC"
+}
+success() {
+    printf '  %s[成功] %s%s\n' "$GREEN" "$*" "$NC"
+}
 interrupt_exit() {
     printf '\n'
     exit 130
@@ -69,23 +79,23 @@ interrupt_exit() {
 
 clear_terminal() {
     [[ -t 1 ]] || return 0
-    command -v clear >/dev/null 2>&1 && clear 2>/dev/null || true
+    command -v clear > /dev/null 2>&1 && clear 2> /dev/null || true
     printf '\033[3J\033[2J\033[H\033[0m'
 }
 
-# 日志轮转与临时文件维护
+# === 日志轮转与临时文件维护 ===
 file_size_bytes() {
     local file=$1 size
-    size=$(stat -c '%s' "$file" 2>/dev/null || true)
+    size=$(stat -c '%s' "$file" 2> /dev/null || true)
     if [[ $size =~ ^[0-9]+$ ]]; then
         printf '%s' "$size"
     else
-        wc -c <"$file" 2>/dev/null | tr -d '[:space:]' || printf '0'
+        wc -c < "$file" 2> /dev/null | tr -d '[:space:]' || printf '0'
     fi
 }
 
 rotate_file_log() {
-    # 原地截断活动日志，保持服务正在写入的 inode。
+    # 原地截断活动日志，保持服务正在写入的 inode
     local file=$1 size temp index
     [[ -f $file ]] || return 0
     size=$(file_size_bytes "$file")
@@ -93,12 +103,12 @@ rotate_file_log() {
     ((size > LOG_MAX_BYTES)) || return 0
     rm -f -- "$file.$((LOG_ROTATIONS + 1))"
     for ((index = LOG_ROTATIONS; index > 1; index--)); do
-        [[ -e "$file.$((index - 1))" ]] && mv -f -- "$file.$((index - 1))" "$file.$index" 2>/dev/null || true
+        [[ -e "$file.$((index - 1))" ]] && mv -f -- "$file.$((index - 1))" "$file.$index" 2> /dev/null || true
     done
-    cp -p -- "$file" "$file.1" 2>/dev/null || return 0
+    cp -p -- "$file" "$file.1" 2> /dev/null || return 0
     temp=$(mktemp "${file}.trim.XXXXXX") || return 0
-    if tail -c "$LOG_KEEP_BYTES" "$file" >"$temp" 2>/dev/null && cat "$temp" >"$file"; then
-        chmod 640 "$file" 2>/dev/null || true
+    if tail -c "$LOG_KEEP_BYTES" "$file" > "$temp" 2> /dev/null && cat "$temp" > "$file"; then
+        chmod 640 "$file" 2> /dev/null || true
     fi
     rm -f -- "$temp"
 }
@@ -113,9 +123,9 @@ cleanup_stale_temp_files() {
     for pattern in "$@"; do
         find_args+=(-name "$pattern" -o)
     done
-    # 末尾的 -false 使最后一个 -o 保持等价的短路表达式。
+    # 末尾的 -false 使最后一个 -o 保持等价的短路表达式
     find_args+=(-false \) -exec rm -rf -- {} +)
-    find "${find_args[@]}" 2>/dev/null || true
+    find "${find_args[@]}" 2> /dev/null || true
 }
 
 maintenance_cleanup() {
@@ -124,7 +134,7 @@ maintenance_cleanup() {
     cleanup_stale_temp_files "${RT%/*}" '.realm-manager.*'
 }
 
-# 交互输入、网络请求与版本识别
+# === 交互输入、网络请求与版本识别 ===
 read_input() {
     local destination=$1 prompt=$2 reply='' status=0
     read -r -p "$prompt" reply || status=$?
@@ -147,7 +157,7 @@ pause_enter() {
     return 0
 }
 get() (
-    # 网络子进程不应继承管理锁，避免短暂下载进程延长锁的生命周期。
+    # 网络子进程不应继承管理锁，避免短暂下载进程延长锁的生命周期
     exec 9>&-
     curl -fLsS --retry 2 --connect-timeout 15 --max-time 180 --proto '=https' --proto-redir '=https' "$1" -o "$2"
 )
@@ -182,7 +192,7 @@ service_command() {
         if [[ -f $UNIT ]]; then
             command=$(awk '/^ExecStart=/{sub(/^ExecStart=/, ""); print; exit}' "$UNIT")
         else
-            command=$(systemctl show realm -p ExecStart --value 2>/dev/null || true)
+            command=$(systemctl show realm -p ExecStart --value 2> /dev/null || true)
         fi
     elif [[ -f $UNIT ]]; then
         local path args
@@ -201,7 +211,7 @@ service_config_path() {
     printf '%s\n' "$path"
 }
 
-# 外部服务边界、核心探测与依赖
+# === 外部服务边界、核心探测与依赖 ===
 foreign_service() {
     local command=$1 path
     path=$(service_config_path "$command")
@@ -221,10 +231,10 @@ resolve_core() {
     BIN=$MANAGED_BIN
     SYSTEM_REALM=''
     [[ -x $BIN ]] && return 0
-    if discovered=$(configured_core 2>/dev/null); then
+    if discovered=$(configured_core 2> /dev/null); then
         [[ $discovered != "$MANAGED_BIN" && -x $discovered ]] && SYSTEM_REALM=$discovered
     fi
-    if [[ -z $SYSTEM_REALM ]] && discovered=$(command -v realm 2>/dev/null); then
+    if [[ -z $SYSTEM_REALM ]] && discovered=$(command -v realm 2> /dev/null); then
         [[ $discovered != "$MANAGED_BIN" && $discovered == /* && -x $discovered ]] && SYSTEM_REALM=$discovered
     fi
     for candidate in /usr/local/bin/realm /usr/bin/realm /usr/local/sbin/realm /usr/sbin/realm; do
@@ -237,32 +247,36 @@ resolve_core() {
 dependencies() {
     local cmd missing=0
     local -a required=(curl jq tar sha256sum timeout flock ss pgrep getent)
-    for cmd in "${required[@]}"; do command -v "$cmd" >/dev/null || missing=1; done
+    for cmd in "${required[@]}"; do
+        command -v "$cmd" > /dev/null || missing=1
+    done
     ((missing)) || return 0
     install_packages || return 1
-    for cmd in "${required[@]}"; do command -v "$cmd" >/dev/null || return 1; done
+    for cmd in "${required[@]}"; do
+        command -v "$cmd" > /dev/null || return 1
+    done
 }
 
-# 管理脚本锁
+# === 管理脚本锁 ===
 is_manager_pid() {
     local pid=$1 interpreter script
     [[ -r /proc/$pid/cmdline ]] || return 1
-    { IFS= read -r -d '' interpreter && IFS= read -r -d '' script; } <"/proc/$pid/cmdline" || return 1
+    { IFS= read -r -d '' interpreter && IFS= read -r -d '' script; } < "/proc/$pid/cmdline" || return 1
     [[ ${interpreter##*/} == bash || ${interpreter##*/} == sh ]] || return 1
     [[ $script == "$RT" || ${script##*/} == realm.sh ]] || return 1
     [[ /proc/$pid/fd/9 -ef $LOCK ]] || return 1
-    grep -q '^lock:.* FLOCK ' "/proc/$pid/fdinfo/9" 2>/dev/null
+    grep -q '^lock:.* FLOCK ' "/proc/$pid/fdinfo/9" 2> /dev/null
 }
 
 lock_holder_pid() {
     local pid fd
-    pid=$(cat "$LOCK" 2>/dev/null) || pid=''
-    if [[ $pid =~ ^[1-9][0-9]*$ ]] && ((pid != $$)) && kill -0 "$pid" 2>/dev/null && is_manager_pid "$pid"; then
+    pid=$(cat "$LOCK" 2> /dev/null) || pid=''
+    if [[ $pid =~ ^[1-9][0-9]*$ ]] && ((pid != $$)) && kill -0 "$pid" 2> /dev/null && is_manager_pid "$pid"; then
         printf '%s\n' "$pid"
         return 0
     fi
 
-    # fdinfo 属于持锁的文件描述符，可排除只打开了锁文件的等待进程。
+    # fdinfo 属于持锁的文件描述符，可排除只打开了锁文件的等待进程
     for fd in /proc/[0-9]*/fd/9; do
         [[ $fd -ef $LOCK ]] || continue
         pid=${fd#/proc/}
@@ -277,34 +291,36 @@ lock_holder_pid() {
 stop_manager() {
     local pid=$1 child
     local -a children=()
-    # 旧版输入辅助进程也可能持锁；仅通知同一脚本的 Bash/sh，不终止服务进程。
+    # 旧版输入辅助进程也可能持锁；仅通知同一脚本的 Bash/sh，不终止服务进程
     if [[ -r /proc/$pid/task/$pid/children ]]; then
-        read -r -a children <"/proc/$pid/task/$pid/children" || true
+        read -r -a children < "/proc/$pid/task/$pid/children" || true
     fi
     for child in "${children[@]}"; do
-        if is_manager_pid "$child"; then stop_manager "$child"; fi
+        if is_manager_pid "$child"; then
+            stop_manager "$child"
+        fi
     done
-    kill -TERM "$pid" 2>/dev/null || true
+    kill -TERM "$pid" 2> /dev/null || true
 }
 
 acquire_lock() {
     local holder attempt
-    exec 9>>"$LOCK" || {
+    exec 9>> "$LOCK" || {
         fail '无法打开管理锁'
         return 1
     }
     if flock -n 9; then
-        printf '%s\n' "$$" >"$LOCK"
+        printf '%s\n' "$$" > "$LOCK"
         return 0
     fi
 
-    holder=$(lock_holder_pid 2>/dev/null) || holder=''
-    if [[ $holder =~ ^[1-9][0-9]*$ ]] && kill -0 "$holder" 2>/dev/null && is_manager_pid "$holder"; then
+    holder=$(lock_holder_pid 2> /dev/null) || holder=''
+    if [[ $holder =~ ^[1-9][0-9]*$ ]] && kill -0 "$holder" 2> /dev/null && is_manager_pid "$holder"; then
         info '检测到旧的管理界面，正在自动接管...'
         stop_manager "$holder"
         for ((attempt = 0; attempt < 50; attempt++)); do
             if flock -n 9; then
-                printf '%s\n' "$$" >"$LOCK"
+                printf '%s\n' "$$" > "$LOCK"
                 success '已关闭旧管理界面'
                 return 0
             fi
@@ -317,23 +333,23 @@ acquire_lock() {
     fail "管理锁被其他进程占用${holder:+（PID: $holder）}，请稍后重试"
 }
 
-# 初始化系统、服务控制与配置
+# === 初始化系统、服务控制与配置 ===
 detect_init() {
-    if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null; then
+    if [[ -d /run/systemd/system ]] && command -v systemctl > /dev/null; then
         INIT=systemd
-        UNIT=/etc/systemd/system/realm.service
-    elif command -v rc-service >/dev/null && command -v rc-update >/dev/null && command -v supervise-daemon >/dev/null; then
+        UNIT=$SYSTEMD_UNIT
+    elif command -v rc-service > /dev/null && command -v rc-update > /dev/null && command -v supervise-daemon > /dev/null; then
         INIT=openrc
-        UNIT=/etc/init.d/realm
+        UNIT=$OPENRC_UNIT
     else
         fail '需要 systemd 或 OpenRC；无 init 的容器请先配置服务管理'
         return 1
     fi
 }
 
-# 只抽象必要的服务动作；转发不使用 nftables、IP forwarding 或特权网络接口。
+# 只抽象必要的服务动作；转发不使用 nftables、IP forwarding 或特权网络接口
 svc() (
-    # 服务管理子进程不应继承管理锁，避免服务守护进程持锁阻塞下一次启动。
+    # 服务管理子进程不应继承管理锁，避免服务守护进程持锁阻塞下一次启动
     exec 9>&-
     case "$1" in
         start | restart) [[ $INIT == systemd ]] || rotate_file_log "$LOG" ;;
@@ -349,7 +365,7 @@ svc() (
         esac
     else
         case "$1" in
-            active) rc-service realm status >/dev/null 2>&1 ;;
+            active) rc-service realm status > /dev/null 2>&1 ;;
             enabled) [[ -e $RUNLEVEL/realm ]] ;;
             pid) pgrep -f -x "$BIN -c ${CONF//./\\.}" ;;
             enable) rc-update add realm default ;;
@@ -371,7 +387,7 @@ check_service() {
         }
         return 0
     fi
-    path=$(systemctl show realm -p FragmentPath --value 2>/dev/null) || return 1
+    path=$(systemctl show realm -p FragmentPath --value 2> /dev/null) || return 1
     [[ -z $path ]] && return 0
     command=$(service_command)
     config_path=$(service_config_path "$command")
@@ -388,7 +404,7 @@ check_service() {
 
 write_unit() {
     if [[ $INIT == openrc ]]; then
-        cat >"$UNIT" <<EOF
+        cat > "$UNIT" << EOF
 #!/sbin/openrc-run
 description="Realm port forwarding"
 command="$BIN"
@@ -405,7 +421,7 @@ EOF
         chmod 755 "$UNIT"
         return
     fi
-    cat >"$UNIT" <<EOF
+    cat > "$UNIT" << EOF
 [Unit]
 Description=Realm port forwarding
 After=network-online.target
@@ -431,16 +447,16 @@ init_config() {
                 type == "object" and (.listen | type == "string") and
                 (.remote | type == "string") and (.network | network_ok) and
                 (.name == null or (.name | type == "string"))))
-        ' "$CONF" >/dev/null || {
+        ' "$CONF" > /dev/null || {
             fail '配置文件格式无效，请检查 /root/realm/config.json'
             return 1
         }
         return 0
     fi
-    printf '{"endpoints":[]}\n' >"$CONF"
+    printf '{"endpoints":[]}\n' > "$CONF"
 }
 
-# 核心安装、服务就绪检查与更新
+# === 核心安装、服务就绪检查与更新 ===
 select_asset() {
     local json=$1 arch=$2 target release
     case "$arch" in
@@ -461,7 +477,7 @@ select_asset() {
         fail '安装包信息重复'
         return 1
     }
-    IFS=$'\t' read -r TAG URL HASH <<<"$release"
+    IFS=$'\t' read -r TAG URL HASH <<< "$release"
     [[ $TAG =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
         fail '无法识别稳定版标签'
         return 1
@@ -483,7 +499,7 @@ ready() {
         svc active || continue
         pid=$(svc pid) || continue
         [[ $pid =~ ^[1-9][0-9]*$ ]] || continue
-        # 直接流式核对监听套接字，避免把完整 ss 输出复制到 Bash 变量，并合并重复的 awk 启动。
+        # 直接流式核对监听套接字，避免把完整 ss 输出复制到 Bash 变量，并合并重复的 awk 启动
         if ss -H -lntup | awk -v expected="$expected" -v pid="pid=$pid," '
             BEGIN {
                 count = split(expected, lines, "\n")
@@ -517,10 +533,10 @@ ready() {
 
 service_state() {
     local result=$1 value
-    resolve_core >/dev/null 2>&1 || true
+    resolve_core > /dev/null 2>&1 || true
     if [[ ! -x $BIN ]]; then
         value='未安装'
-    elif svc active 2>/dev/null; then
+    elif svc active 2> /dev/null; then
         value='运行中'
     else
         value='已停止'
@@ -530,14 +546,14 @@ service_state() {
 
 core_version() {
     local result=$1 value external_version
-    resolve_core >/dev/null 2>&1 || true
+    resolve_core > /dev/null 2>&1 || true
     if [[ ! -x $BIN ]]; then
-        if [[ -n $SYSTEM_REALM ]] && external_version=$(version "$SYSTEM_REALM" 2>/dev/null); then
+        if [[ -n $SYSTEM_REALM ]] && external_version=$(version "$SYSTEM_REALM" 2> /dev/null); then
             value="外部 v$external_version"
         else
             value='未安装'
         fi
-    elif value=$(version "$BIN" 2>/dev/null); then
+    elif value=$(version "$BIN" 2> /dev/null); then
         value="v$value"
     else
         value='未知'
@@ -546,13 +562,13 @@ core_version() {
 }
 
 ensure_core() {
-    resolve_core >/dev/null 2>&1 || true
-    if [[ -x $BIN ]] && version "$BIN" >/dev/null 2>&1; then
+    resolve_core > /dev/null 2>&1 || true
+    if [[ -x $BIN ]] && version "$BIN" > /dev/null 2>&1; then
         return 0
     fi
     update_realm_action || return 1
-    resolve_core >/dev/null 2>&1 || true
-    [[ -x $BIN ]] && version "$BIN" >/dev/null 2>&1 || {
+    resolve_core > /dev/null 2>&1 || true
+    [[ -x $BIN ]] && version "$BIN" > /dev/null 2>&1 || {
         fail 'Realm 核心安装失败'
         return 1
     }
@@ -570,7 +586,7 @@ start_realm() {
         return 1
     }
     ensure_core || return 1
-    svc enabled 2>/dev/null && was_enabled=1
+    svc enabled 2> /dev/null && was_enabled=1
     if [[ ! -f $UNIT ]]; then
         write_unit || {
             fail 'Realm 服务配置创建失败'
@@ -578,41 +594,41 @@ start_realm() {
         }
     fi
     if ! ((was_enabled)); then
-        svc enable >/dev/null 2>&1 || {
+        svc enable > /dev/null 2>&1 || {
             fail 'Realm 开机自启设置失败'
             return 1
         }
     fi
-    if svc active 2>/dev/null; then
+    if svc active 2> /dev/null; then
         success 'Realm 已在运行，开机自启已开启'
         return 0
     fi
-    if svc start >/dev/null 2>&1 && ready; then
+    if svc start > /dev/null 2>&1 && ready; then
         success 'Realm 已启动，开机自启已开启'
         return 0
     fi
-    ((was_enabled)) || svc disable >/dev/null 2>&1 || true
+    ((was_enabled)) || svc disable > /dev/null 2>&1 || true
     fail 'Realm 启动失败，已恢复原开机自启状态'
     return 1
 }
 
 stop_realm() {
     local active=0 enabled=0
-    svc active 2>/dev/null && active=1
-    svc enabled 2>/dev/null && enabled=1
-    if ((!active && !enabled)); then
+    svc active 2> /dev/null && active=1
+    svc enabled 2> /dev/null && enabled=1
+    if ((! active && ! enabled)); then
         info 'Realm 已停止，且开机自启未开启'
         return 0
     fi
-    if ((active)) && ! svc stop >/dev/null 2>&1; then
+    if ((active)) && ! svc stop > /dev/null 2>&1; then
         fail 'Realm 停止失败，开机自启保持不变'
         return 1
     fi
-    if ((enabled)) && ! svc disable >/dev/null 2>&1; then
+    if ((enabled)) && ! svc disable > /dev/null 2>&1; then
         fail 'Realm 已停止，但取消开机自启失败'
         return 1
     fi
-    if svc active 2>/dev/null || svc enabled 2>/dev/null; then
+    if svc active 2> /dev/null || svc enabled 2> /dev/null; then
         fail 'Realm 状态未完全停止，请稍后检查'
         return 1
     fi
@@ -633,11 +649,11 @@ restart_realm() {
             return 1
         }
     fi
-    svc enable >/dev/null 2>&1 || {
+    svc enable > /dev/null 2>&1 || {
         fail 'Realm 开机自启设置失败，未执行重启'
         return 1
     }
-    if svc restart >/dev/null 2>&1 && ready; then
+    if svc restart > /dev/null 2>&1 && ready; then
         success 'Realm 已重启，开机自启已开启'
         return 0
     fi
@@ -647,7 +663,7 @@ restart_realm() {
 
 update_realm() (
     local temp active=0 replaced=0 had=0 status interrupted=0 sum member current
-    resolve_core >/dev/null 2>&1 || true
+    resolve_core > /dev/null 2>&1 || true
     temp=$(mktemp -d "$DIR/.download.XXXXXX") || exit 1
     cleanup() {
         status=$?
@@ -655,12 +671,14 @@ update_realm() (
         trap - EXIT
         trap '' INT TERM HUP
         if ((replaced)); then
-            svc stop >/dev/null 2>&1 || true
+            svc stop > /dev/null 2>&1 || true
             if ((had)); then
                 cp -p "$temp/old" "$BIN.restore" && mv -f "$BIN.restore" "$BIN" || fail '恢复旧程序失败'
-            else rm -f "$BIN"; fi
+            else
+                rm -f "$BIN"
+            fi
             if ((active)); then
-                svc reset >/dev/null 2>&1 || true
+                svc reset > /dev/null 2>&1 || true
                 svc restart && ready || fail '旧程序恢复后未能启动'
             fi
             fail '升级未成功，已尝试恢复原程序'
@@ -677,7 +695,7 @@ update_realm() (
         fail '获取最新版本失败，请检查 GitHub 访问或 API 限流'
         exit 1
     }
-    current=$(version "$BIN" 2>/dev/null) || current=''
+    current=$(version "$BIN" 2> /dev/null) || current=''
     [[ $current != "${TAG#v}" ]] || {
         info "Realm 核心已是最新版本 $TAG"
         exit 0
@@ -688,11 +706,11 @@ update_realm() (
         fail 'SHA256 校验失败'
         exit 1
     }
-    tar -tzf "$temp/package.tar.gz" >"$temp/files" || exit 1
+    tar -tzf "$temp/package.tar.gz" > "$temp/files" || exit 1
     member=$(awk '/(^|\/)realm$/ {print}' "$temp/files")
     [[ -n $member && $member != *$'\n'* && $member != /* && $member != *'..'* ]] || exit 1
-    tar -xOzf "$temp/package.tar.gz" -- "$member" >"$temp/realm" && chmod 755 "$temp/realm" || exit 1
-    current=$(version "$temp/realm" 2>"$temp/version.error") || {
+    tar -xOzf "$temp/package.tar.gz" -- "$member" > "$temp/realm" && chmod 755 "$temp/realm" || exit 1
+    current=$(version "$temp/realm" 2> "$temp/version.error") || {
         fail "新版程序无法执行或无法读取版本（架构：$(uname -m)）"
         cat "$temp/version.error" >&2
         exit 1
@@ -703,13 +721,19 @@ update_realm() (
     }
     if [[ -f $BIN ]]; then
         cp -p "$BIN" "$temp/old" || exit 1
-        if [[ $BIN == "$MANAGED_BIN" ]]; then cp -p "$BIN" "$BIN.bak" || exit 1; fi
+        if [[ $BIN == "$MANAGED_BIN" ]]; then
+            cp -p "$BIN" "$BIN.bak" || exit 1
+        fi
         had=1
     fi
-    if svc active; then active=1; fi
+    if svc active; then
+        active=1
+    fi
     replaced=1
     mkdir -p "${BIN%/*}" && mv -f "$temp/realm" "$BIN" || exit 1
-    if ((active)); then svc restart && ready || exit 1; fi
+    if ((active)); then
+        svc restart && ready || exit 1
+    fi
     replaced=0
     success "Realm 核心已更新至 $TAG"
 )
@@ -732,7 +756,7 @@ update_script() (
         fail '管理脚本下载失败，请检查 GitHub 连接'
         exit 1
     }
-    IFS= read -r first_line <"$temp" || true
+    IFS= read -r first_line < "$temp" || true
     [[ $first_line == '#!/bin/sh' ]] || {
         fail '下载内容不是有效的管理脚本'
         exit 1
@@ -776,14 +800,16 @@ reload_script() {
     fail '无法重新加载管理脚本，请重新运行 r'
 }
 
-# 规则输入校验与配置事务
-valid_port() { [[ $1 =~ ^[0-9]{1,5}$ ]] && ((10#$1 > 0 && 10#$1 < 65536)); }
+# === 规则输入校验与配置事务 ===
+valid_port() {
+    [[ $1 =~ ^[0-9]{1,5}$ ]] && ((10#$1 > 0 && 10#$1 < 65536))
+}
 
 valid_ipv4() {
     local octet
     local -a octets
     [[ $1 =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
-    IFS=. read -r -a octets <<<"$1"
+    IFS=. read -r -a octets <<< "$1"
     for octet in "${octets[@]}"; do
         [[ $octet == 0 || $octet != 0* ]] && ((10#$octet <= 255)) || return 1
     done
@@ -806,9 +832,15 @@ valid_ipv6() {
     else
         [[ $address != :* && $address != *: ]] || return 1
     fi
-    [[ -z $address ]] || IFS=: read -r -a groups <<<"$address"
-    for group in "${groups[@]}"; do [[ $group =~ ^[a-fA-F0-9]{1,4}$ ]] || return 1; done
-    if ((compressed)); then ((${#groups[@]} < 8)); else ((${#groups[@]} == 8)); fi
+    [[ -z $address ]] || IFS=: read -r -a groups <<< "$address"
+    for group in "${groups[@]}"; do
+        [[ $group =~ ^[a-fA-F0-9]{1,4}$ ]] || return 1
+    done
+    if ((compressed)); then
+        ((${#groups[@]} < 8))
+    else
+        ((${#groups[@]} == 8))
+    fi
 }
 
 valid_host() {
@@ -819,7 +851,7 @@ valid_host() {
         valid_ipv4 "$1"
         return
     fi
-    IFS=. read -r -a labels <<<"$host"
+    IFS=. read -r -a labels <<< "$host"
     for label in "${labels[@]}"; do
         [[ ${#label} -le 63 && $label =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]] || return 1
     done
@@ -856,7 +888,7 @@ remote_address() {
 show_resolution() {
     local host=$1 output address resolved='' family=''
     [[ $host != *:* ]] && ! valid_ipv4 "$host" || return 0
-    output=$(timeout 5 getent ahosts "$host" 9>&- 2>/dev/null) || output=''
+    output=$(timeout 5 getent ahosts "$host" 9>&- 2> /dev/null) || output=''
     while read -r address _; do
         if valid_ipv4 "$address"; then
             resolved=$address
@@ -866,7 +898,7 @@ show_resolution() {
             resolved=$address
             family=ipv6
         fi
-    done <<<"$output"
+    done <<< "$output"
     if [[ -n $resolved ]]; then
         success "域名已解析: $host -> $resolved ($family)"
     else
@@ -874,27 +906,39 @@ show_resolution() {
     fi
 }
 
-# 子 shell 限定临时变量和 trap 的作用域，失败时按原状态恢复服务。
+# 子 shell 限定临时变量和 trap 的作用域，失败时按原状态恢复服务
 apply_rules() (
     local candidate=$1 temp active=0 had_unit=0 changed=0 enabled=0 status interrupted=0 count
     temp=$(mktemp -d "$DIR/.change.XXXXXX") || exit 1
-    if svc active 2>/dev/null; then active=1; fi
-    if svc enabled 2>/dev/null; then enabled=1; fi
+    if svc active 2> /dev/null; then
+        active=1
+    fi
+    if svc enabled 2> /dev/null; then
+        enabled=1
+    fi
     rollback() {
         status=$?
         ((status == 130)) && interrupted=1
         trap - EXIT
         trap '' INT TERM HUP
         if ((changed)); then
-            svc stop >/dev/null 2>&1 || true
-            if ((enabled == 0)); then svc disable >/dev/null 2>&1 || true; fi
+            svc stop > /dev/null 2>&1 || true
+            if ((enabled == 0)); then
+                svc disable > /dev/null 2>&1 || true
+            fi
             cp -p "$temp/config" "$CONF" || fail '恢复旧配置失败'
-            if ((had_unit)); then cp -p "$temp/unit" "$UNIT"; else rm -f "$UNIT"; fi
-            svc reload >/dev/null 2>&1 || true
-            if ((enabled)); then svc enable >/dev/null 2>&1 || true; fi
+            if ((had_unit)); then
+                cp -p "$temp/unit" "$UNIT"
+            else
+                rm -f "$UNIT"
+            fi
+            svc reload > /dev/null 2>&1 || true
+            if ((enabled)); then
+                svc enable > /dev/null 2>&1 || true
+            fi
             if ((active)); then
-                svc reset >/dev/null 2>&1 || true
-                svc restart >/dev/null 2>&1 && ready || fail '恢复旧服务失败'
+                svc reset > /dev/null 2>&1 || true
+                svc restart > /dev/null 2>&1 && ready || fail '恢复旧服务失败'
             fi
             fail '修改未生效，已尝试恢复原规则'
             ((interrupted)) || status=1
@@ -922,21 +966,25 @@ apply_rules() (
     if ((count)); then
         write_unit || exit 1
         if ((active)); then
-            svc restart >/dev/null 2>&1 && ready || exit 1
+            svc restart > /dev/null 2>&1 && ready || exit 1
         else
             if ((enabled == 0)); then
-                svc enable >/dev/null 2>&1 || exit 1
+                svc enable > /dev/null 2>&1 || exit 1
             fi
-            svc start >/dev/null 2>&1 && ready || exit 1
+            svc start > /dev/null 2>&1 && ready || exit 1
         fi
     elif ((had_unit)); then
-        if ((active)); then svc stop >/dev/null 2>&1 || exit 1; fi
-        if ((enabled)); then svc disable >/dev/null 2>&1 || exit 1; fi
+        if ((active)); then
+            svc stop > /dev/null 2>&1 || exit 1
+        fi
+        if ((enabled)); then
+            svc disable > /dev/null 2>&1 || exit 1
+        fi
     fi
     changed=0
 )
 
-# 转发规则展示与编辑
+# === 转发规则展示与编辑 ===
 print_rules() {
     local index name listen remote protocol port
     while IFS=$'\t' read -r index name listen remote protocol; do
@@ -1011,7 +1059,7 @@ save_rule() {
     if jq -e --argjson i "$index" --arg p "$port" --arg proto "$protocol" "$JQ_PROTOCOL"'
         .network as $g | .endpoints | to_entries | any(
             .key != $i and (.value.listen | split(":") | last)==$p
-            and ((.value | protocol($g)) as $old | $old==$proto or $old=="tcp+udp" or $proto=="tcp+udp"))' "$CONF" >/dev/null; then
+            and ((.value | protocol($g)) as $old | $old==$proto or $old=="tcp+udp" or $proto=="tcp+udp"))' "$CONF" > /dev/null; then
         fail "${protocol^^} 端口 $port 已有转发规则"
         return 1
     else
@@ -1021,7 +1069,9 @@ save_rule() {
         current=$(jq -r --argjson i "$index" '.endpoints[$i].listen' "$CONF") || return 1
         old_protocol=$(jq -r --argjson i "$index" "$JQ_PROTOCOL"'
             .network as $g | .endpoints[$i] | protocol($g)' "$CONF") || return 1
-        if svc active; then pid=$(svc pid) || pid=''; fi
+        if svc active; then
+            pid=$(svc pid) || pid=''
+        fi
     fi
     for proto in tcp udp; do
         [[ $protocol == "$proto" || $protocol == tcp+udp ]] || continue
@@ -1033,20 +1083,22 @@ save_rule() {
         }
         [[ -n $sockets ]] || continue
         if [[ ${current##*:} == "$port" && ($old_protocol == "$proto" || $old_protocol == tcp+udp) && $pid =~ ^[1-9][0-9]*$ ]] &&
-            awk -v pid="pid=$pid," '!index($0,pid) {bad=1} END {exit bad}' <<<"$sockets"; then continue; fi
+            awk -v pid="pid=$pid," '!index($0,pid) {bad=1} END {exit bad}' <<< "$sockets"; then
+            continue
+        fi
         fail "${proto^^} 端口 $port 已被占用"
         return 1
     done
     temp=$(mktemp "$DIR/.rules.XXXXXX") || return 1
     trap 'rm -f -- "$temp"; interrupt_exit' INT
-    # 保留已有规则的监听地址；新规则默认双栈监听。
+    # 保留已有规则的监听地址；新规则默认双栈监听
     local listen="${current%:*}:$port"
     [[ -n $current ]] || listen="[::]:$port"
     jq --argjson i "$index" --arg l "$listen" --arg r "$remote" --arg proto "$protocol" --arg name "$name" '
         {listen:$l,remote:$r,name:$name} as $rule
         | {no_tcp:($proto=="udp"),use_udp:($proto!="tcp")} as $net
         | if $i<0 then .endpoints += [$rule + {network:$net}]
-          else .endpoints[$i] |= (. + $rule | .network = ((.network // {}) + $net)) end' "$CONF" >"$temp" && apply_rules "$temp"
+          else .endpoints[$i] |= (. + $rule | .network = ((.network // {}) + $net)) end' "$CONF" > "$temp" && apply_rules "$temp"
     local status=$?
     trap interrupt_exit INT
     rm -f "$temp"
@@ -1129,7 +1181,7 @@ edit_rule() {
     while true; do
         read_input h "$host_prompt" || return 1
         h=${h:-$host}
-        if remote_address "$h" 1 >/dev/null; then
+        if remote_address "$h" 1 > /dev/null; then
             host=$h
             break
         fi
@@ -1163,22 +1215,84 @@ delete_rules() {
     fi
     temp=$(mktemp "$DIR/.rules.XXXXXX") || return 1
     trap 'rm -f -- "$temp"; interrupt_exit' INT
-    jq --argjson i "$index" 'if $i<0 then .endpoints=[] else del(.endpoints[$i]) end' "$CONF" >"$temp" && apply_rules "$temp"
+    jq --argjson i "$index" 'if $i<0 then .endpoints=[] else del(.endpoints[$i]) end' "$CONF" > "$temp" && apply_rules "$temp"
     status=$?
     trap interrupt_exit INT
     rm -f "$temp"
     if ((status == 0)); then
         if ((index == -1)); then
             success '所有端口转发规则已清空'
-        else success "已删除端口 ${selected_port} 的转发规则"; fi
+        else
+            success "已删除端口 ${selected_port} 的转发规则"
+        fi
     fi
     return "$status"
 }
 
-# 卸载与菜单入口
+# === 卸载清理 ===
+check_uninstall_unit() {
+    local path=$1 kind=$2 command='' binary args
+    [[ -e $path || -L $path ]] || return 0
+    # 仅删除本脚本生成的普通服务文件，不接管同名外部服务或链接
+    if [[ -f $path && ! -L $path ]]; then
+        if [[ $kind == systemd ]]; then
+            command=$(awk '/^ExecStart=/{sub(/^ExecStart=/, ""); print; exit}' "$path")
+        else
+            binary=$(awk -F'"' '/^command=/{print $2; exit}' "$path")
+            args=$(awk -F'"' '/^command_args=/{print $2; exit}' "$path")
+            [[ -n $binary ]] && command="$binary${args:+ $args}"
+        fi
+        [[ $command == "$MANAGED_BIN -c $CONF" ]] && return 0
+    fi
+    fail "无法确认服务文件归属，未执行卸载：$path"
+}
+
+normalize_uninstall_path() {
+    local path=$1 directory part result=''
+    local -a parts
+    [[ $path == /* ]] || path="$PWD/$path"
+    if directory=$(cd -P -- "${path%/*}" 2> /dev/null && pwd -P); then
+        printf '%s/%s\n' "${directory%/}" "${path##*/}"
+        return 0
+    fi
+    IFS=/ read -r -a parts <<< "$path"
+    for part in "${parts[@]}"; do
+        case "$part" in
+            '' | .) ;;
+            ..) result=${result%/*} ;;
+            *) result+="/$part" ;;
+        esac
+    done
+    printf '%s\n' "${result:-/}"
+}
+
+check_uninstall_startup() {
+    local path=$1 unit=$2 target
+    [[ -e $path || -L $path ]] || return 0
+    if [[ -L $path ]]; then
+        [[ $path -ef $unit ]] && return 0
+        # 目标可能已删除；按路径段比较相对链接，避免依赖 GNU readlink 扩展
+        target=$(readlink "$path") || return 1
+        [[ $target == /* ]] || target="${path%/*}/$target"
+        [[ $(normalize_uninstall_path "$target") == "$(normalize_uninstall_path "$unit")" ]] && return 0
+    fi
+    fail "无法确认自启文件归属，未执行卸载：$path"
+}
+
+remove_uninstall_paths() {
+    local mode=$1 path
+    shift
+    for path in "$@"; do
+        [[ -e $path || -L $path ]] || continue
+        if ! rm "$mode" -- "$path" || [[ -e $path || -L $path ]]; then
+            fail "卸载文件清理失败：$path"
+            return 1
+        fi
+    done
+}
+
 uninstall() {
-    local answer startup="$RUNLEVEL/realm"
-    [[ $INIT != systemd ]] || startup="${UNIT%/*}/multi-user.target.wants/realm.service"
+    local answer leftover systemd_startup="${SYSTEMD_UNIT%/*}/multi-user.target.wants/realm.service" openrc_startup="$RUNLEVEL/realm"
     printf '\n'
     info '=== 一键卸载 Realm ==='
     printf '\n'
@@ -1188,29 +1302,59 @@ uninstall() {
         return 1
     }
     check_service || return 1
-    if [[ -f $UNIT ]] || svc active; then svc stop >/dev/null 2>&1 || {
-        fail '停止服务失败，未删除文件'
-        return 1
-    }; fi
-    if svc enabled 2>/dev/null; then svc disable >/dev/null 2>&1 || {
-        fail '取消自启失败，未删除文件'
-        return 1
-    }; fi
+    # 在停止服务前检查两套 init 文件，兼容历史服务残留并保护同名外部服务
+    check_uninstall_unit "$SYSTEMD_UNIT" systemd && check_uninstall_unit "$SYSTEMD_UNIT.bak" systemd &&
+        check_uninstall_unit "$OPENRC_UNIT" openrc && check_uninstall_unit "$OPENRC_UNIT.bak" openrc &&
+        check_uninstall_startup "$systemd_startup" "$SYSTEMD_UNIT" &&
+        check_uninstall_startup "$openrc_startup" "$OPENRC_UNIT" || return 1
+    if [[ -f $UNIT ]] || svc active; then
+        svc stop > /dev/null 2>&1 || {
+            fail '停止服务失败，未删除文件'
+            return 1
+        }
+    fi
+    if svc enabled 2> /dev/null; then
+        svc disable > /dev/null 2>&1 || {
+            fail '取消自启失败，未删除文件'
+            return 1
+        }
+    fi
     if svc active; then
         fail '服务仍在运行，未删除文件'
         return 1
     fi
-    svc reset >/dev/null 2>&1 || true
-    rm -f -- "$UNIT" "$UNIT.bak" "$startup" || return 1
-    svc reload >/dev/null 2>&1 || return 1
-    rm -f -- "${RT%/*}"/.realm-manager.?????? || return 1
-    rm -f -- "$CONF" "$CONF.bak" "$MANAGED_BIN" "$MANAGED_BIN.bak" || return 1
-    rm -rf -- "$DIR"/.download.?????? "$DIR"/.change.?????? "$DIR"/.rules.?????? || return 1
-    rmdir "$DIR" 2>/dev/null || true
-    rm -f -- "$LOG" "$LOG".* "$RT" "$LOCK" || return 1
+    if svc enabled 2> /dev/null; then
+        fail '服务仍启用开机自启，未删除文件'
+        return 1
+    fi
+    svc reset > /dev/null 2>&1 || true
+    remove_uninstall_paths -f "$SYSTEMD_UNIT" "$SYSTEMD_UNIT.bak" "$systemd_startup" \
+        "$OPENRC_UNIT" "$OPENRC_UNIT.bak" "$openrc_startup" || return 1
+    svc reload > /dev/null 2>&1 || {
+        fail '服务管理器重新加载失败，未完成卸载'
+        return 1
+    }
+    remove_uninstall_paths -f "${RT%/*}"/.realm-manager.?????? \
+        "$CONF" "$CONF.bak" "$MANAGED_BIN" "$MANAGED_BIN.bak" "$MANAGED_BIN.restore" || return 1
+    remove_uninstall_paths -rf "$DIR"/.download.?????? "$DIR"/.change.?????? "$DIR"/.rules.?????? || return 1
+    if [[ -d $DIR ]]; then
+        leftover=$(find "$DIR" -mindepth 1 -maxdepth 1 -print -quit) || {
+            fail "管理目录检查失败：$DIR"
+            return 1
+        }
+        if [[ -n $leftover ]]; then
+            warn "管理目录包含未识别文件，已保留：$DIR"
+        elif ! rmdir "$DIR"; then
+            fail "管理目录清理失败：$DIR"
+            return 1
+        fi
+    fi
+    remove_uninstall_paths -f "$LOG" "$LOG".* "$LOCK" || return 1
+    remove_uninstall_paths -f "$RT" || return 1
     printf '  卸载完成：服务、核心、规则、备份、独立日志和 r 命令已清理\n'
 }
 
+# === 菜单与命令行入口 ===
 run_menu_action() {
     "$@"
     local status=$?
@@ -1304,7 +1448,11 @@ menu() {
                     return
                 fi
                 ;;
-            11) if run_menu_action uninstall; then return 0; fi ;;
+            11)
+                if run_menu_action uninstall; then
+                    return 0
+                fi
+                ;;
             0) return 0 ;;
             *) fail '无效选项' ;;
         esac
@@ -1346,7 +1494,7 @@ main() {
         update_management_script && reload_script
         return
     fi
-    resolve_core >/dev/null 2>&1 || true
+    resolve_core > /dev/null 2>&1 || true
     check_service || return 1
     if [[ ${1:-} == --uninstall ]]; then
         uninstall
