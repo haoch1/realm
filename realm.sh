@@ -32,7 +32,7 @@ fi
 
 # === 运行时路径与版本 ===
 DIR=/root/realm
-SCRIPT_VERSION=1.0.9
+SCRIPT_VERSION=1.0.10
 MANAGED_BIN=$DIR/realm
 BIN=$MANAGED_BIN
 SYSTEM_REALM=''
@@ -1091,9 +1091,12 @@ save_rule() {
     done
     temp=$(mktemp "$DIR/.rules.XXXXXX") || return 1
     trap 'rm -f -- "$temp"; interrupt_exit' INT
-    # 保留已有规则的监听地址；新规则默认双栈监听
+    # 保留已有规则的监听地址；IPv4-only 系统不能绑定 [::]
     local listen="${current%:*}:$port"
-    [[ -n $current ]] || listen="[::]:$port"
+    if [[ -z $current ]]; then
+        listen="[::]:$port"
+        [[ -e /proc/net/if_inet6 ]] || listen="0.0.0.0:$port"
+    fi
     jq --argjson i "$index" --arg l "$listen" --arg r "$remote" --arg proto "$protocol" --arg name "$name" '
         {listen:$l,remote:$r,name:$name} as $rule
         | {no_tcp:($proto=="udp"),use_udp:($proto!="tcp")} as $net
