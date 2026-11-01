@@ -32,7 +32,7 @@ fi
 
 # === 运行时路径与版本 ===
 DIR=/root/realm
-SCRIPT_VERSION=1.0.10
+SCRIPT_VERSION=1.0.11
 MANAGED_BIN=$DIR/realm
 BIN=$MANAGED_BIN
 SYSTEM_REALM=''
@@ -291,7 +291,7 @@ lock_holder_pid() {
 stop_manager() {
     local pid=$1 child
     local -a children=()
-    # 旧版输入辅助进程也可能持锁；仅通知同一脚本的 Bash/sh，不终止服务进程
+    # 仅通知同一脚本的 Bash/sh 子进程，不终止服务进程
     if [[ -r /proc/$pid/task/$pid/children ]]; then
         read -r -a children < "/proc/$pid/task/$pid/children" || true
     fi
@@ -1234,11 +1234,11 @@ delete_rules() {
 
 # === 卸载清理 ===
 check_uninstall_unit() {
-    local path=$1 kind=$2 command='' binary args
+    local path=$1 command='' binary args
     [[ -e $path || -L $path ]] || return 0
     # 仅删除本脚本生成的普通服务文件，不接管同名外部服务或链接
     if [[ -f $path && ! -L $path ]]; then
-        if [[ $kind == systemd ]]; then
+        if [[ $INIT == systemd ]]; then
             command=$(awk '/^ExecStart=/{sub(/^ExecStart=/, ""); print; exit}' "$path")
         else
             binary=$(awk -F'"' '/^command=/{print $2; exit}' "$path")
@@ -1295,7 +1295,8 @@ remove_uninstall_paths() {
 }
 
 uninstall() {
-    local answer leftover systemd_startup="${SYSTEMD_UNIT%/*}/multi-user.target.wants/realm.service" openrc_startup="$RUNLEVEL/realm"
+    local answer leftover startup="$RUNLEVEL/realm"
+    [[ $INIT == systemd ]] && startup="${SYSTEMD_UNIT%/*}/multi-user.target.wants/realm.service"
     printf '\n'
     info '=== 一键卸载 Realm ==='
     printf '\n'
@@ -1305,11 +1306,7 @@ uninstall() {
         return 1
     }
     check_service || return 1
-    # 在停止服务前检查两套 init 文件，兼容历史服务残留并保护同名外部服务
-    check_uninstall_unit "$SYSTEMD_UNIT" systemd && check_uninstall_unit "$SYSTEMD_UNIT.bak" systemd &&
-        check_uninstall_unit "$OPENRC_UNIT" openrc && check_uninstall_unit "$OPENRC_UNIT.bak" openrc &&
-        check_uninstall_startup "$systemd_startup" "$SYSTEMD_UNIT" &&
-        check_uninstall_startup "$openrc_startup" "$OPENRC_UNIT" || return 1
+    check_uninstall_unit "$UNIT" && check_uninstall_startup "$startup" "$UNIT" || return 1
     if [[ -f $UNIT ]] || svc active; then
         svc stop > /dev/null 2>&1 || {
             fail '停止服务失败，未删除文件'
@@ -1331,8 +1328,7 @@ uninstall() {
         return 1
     fi
     svc reset > /dev/null 2>&1 || true
-    remove_uninstall_paths -f "$SYSTEMD_UNIT" "$SYSTEMD_UNIT.bak" "$systemd_startup" \
-        "$OPENRC_UNIT" "$OPENRC_UNIT.bak" "$openrc_startup" || return 1
+    remove_uninstall_paths -f "$UNIT" "$startup" || return 1
     svc reload > /dev/null 2>&1 || {
         fail '服务管理器重新加载失败，未完成卸载'
         return 1
