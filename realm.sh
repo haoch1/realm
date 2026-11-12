@@ -32,7 +32,7 @@ fi
 
 # === 运行时路径与版本 ===
 DIR=/root/realm
-SCRIPT_VERSION=1.0.13
+SCRIPT_VERSION=2.0.0
 MANAGED_BIN=$DIR/realm
 BIN=$MANAGED_BIN
 SYSTEM_REALM=''
@@ -160,11 +160,15 @@ confirm_action() {
     done
 }
 
-wait_for_reload() {
-    local status=0
-    read -r -p '  按回车加载最新脚本...' _ || status=$?
+pause_enter() {
+    local prompt="${1:-  按回车返回主菜单...}" status=0
+    read -r -p "$prompt" _ || status=$?
     ((status == 130)) && interrupt_exit
-    ((status == 0))
+    if ((status != 0)); then
+        INPUT_EOF=1
+        return 1
+    fi
+    return 0
 }
 
 get() (
@@ -1206,6 +1210,7 @@ edit_rule() {
 modify_rule() {
     local index=$1 port host target protocol name remote choice value previous
     while true; do
+        clear_terminal
         value=$(jq -r --argjson i "$index" '.endpoints[$i].listen' "$CONF") || return 1
         port=${value##*:}
         remote=$(jq -r --argjson i "$index" '.endpoints[$i].remote' "$CONF") || return 1
@@ -1219,12 +1224,13 @@ modify_rule() {
             "$GREEN" "$NC" "$GREEN" "$NC" "$GREEN" "$NC" "$GREEN" "$NC" "$GREEN" "$NC" "$GREEN" "$NC"
         read_input choice '  请选择修改项: ' || return 1
         case "$choice" in
-            0 | '') return 0 ;;
+            0 | '') MENU_CANCELLED=1; return 0 ;;
             1)
                 read_input value "  请输入新备注名称 (回车保持 $name): " || return 1
                 value=${value:-$name}
                 [[ ${#value} -le 60 && ! $value =~ [[:cntrl:]] ]] || {
                     fail '备注限 60 字，不能包含控制字符'
+                    pause_enter '  按回车返回修改规则菜单...' || return 1
                     continue
                 }
                 previous=$name
@@ -1233,7 +1239,10 @@ modify_rule() {
             2)
                 read_input value "  请输入新的目标地址 (回车保持 $host): " || return 1
                 value=${value:-$host}
-                remote_address "$value" "$target" > /dev/null || continue
+                remote_address "$value" "$target" > /dev/null || {
+                    pause_enter '  按回车返回修改规则菜单...' || return 1
+                    continue
+                }
                 [[ $value != "$host" ]] || continue
                 show_resolution "$value" || return 1
                 previous=$host
@@ -1254,10 +1263,15 @@ modify_rule() {
                 previous=$protocol
                 protocol=$value
                 ;;
-            *) fail '无效选择'; continue ;;
+            *)
+                fail '无效选择'
+                pause_enter '  按回车返回修改规则菜单...' || return 1
+                continue
+                ;;
         esac
         [[ $value != "$previous" ]] || continue
         save_rule "$index" "$port" "$host" "$target" "$protocol" "$name" || return 1
+        pause_enter '  按回车返回修改规则菜单...' || return 1
     done
 }
 
@@ -1465,12 +1479,12 @@ menu_row() {
 }
 
 menu() {
-    # 首次进入或加载新版时清屏，后续自动返回时保留操作结果
+    # 操作结果停留到回车，返回菜单时再清屏
     local count choice index state core
-    clear_terminal
     MENU_CANCELLED=0 INPUT_EOF=0
     while true; do
         MENU_CANCELLED=0 INPUT_EOF=0
+        clear_terminal
         count=$(jq '.endpoints|length' "$CONF") || return 1
         service_state state
         core_version core
@@ -1499,7 +1513,6 @@ menu() {
         printf '%s  ║%39s║%s\n' "$BLUE" '' "$NC"
         menu_row "  ${GREEN}[0]${BLUE}  退出脚本${NC}"
         printf '%s  ╚═══════════════════════════════════════╝%s\n\n' "$BLUE" "$NC"
-        printf '  提示：修改直接生效；q 取消/退出；清空和卸载需确认。\n\n'
         read_input choice '  请输入选项 [0-11] (q 退出): ' || {
             ((INPUT_EOF || MENU_CANCELLED)) && return 0
             interrupt_exit
@@ -1531,7 +1544,7 @@ menu() {
                 ;;
             10)
                 if run_menu_action update_management_script; then
-                    wait_for_reload || return 0
+                    pause_enter '  按回车加载最新脚本...' || return 0
                     reload_script
                     return
                 fi
@@ -1545,6 +1558,9 @@ menu() {
             *) fail '无效选项' ;;
         esac
         ((INPUT_EOF)) && return 0
+        if ((!MENU_CANCELLED)); then
+            pause_enter || return 0
+        fi
     done
 }
 

@@ -45,7 +45,7 @@ confirm_action 'confirm' < /dev/null > "$work/output" 2>&1 && bad 'EOF confirmed
 check test "$INPUT_EOF" -eq 1
 pass 'confirmation defaults, invalid input, q/Q and EOF'
 
-# Menu effects use markers; reading a result must never consume the next option.
+# Each operation must wait for Enter before drawing the main menu again.
 menu_effect() { printf '%s\n' "$1" >> "$work/actions"; printf 'result:%s\n' "$1"; }
 setup_menu_stubs() {
     core_version() { printf -v "$1" '%s' '2.9.6'; }
@@ -63,14 +63,21 @@ setup_menu_stubs() {
     setup_menu_stubs
     : > "$work/actions"
     reset_case
-    menu <<< $'2\n6\n7\n8\n9\nq' > "$work/output" 2>&1 || bad 'menu failed'
+    menu <<< $'2\n\n6\n\n7\n\n8\n\n9\n\nq' > "$work/output" 2>&1 || bad 'menu failed'
     check test "$(cat "$work/actions")" = $'view\nstart\nstop\nrestart\ncore'
-    prompt_count 6
+    prompt_count 11
+    check test "$(grep -c '按回车返回主菜单' "$work/prompts")" -eq 5
     check grep -q 'result:view' "$work/output"
     if grep -q $'\033\\[' "$work/output"; then
         # Colour is fine; erase-screen and erase-scrollback escape codes are not.
         grep -qE $'\033\\[(2J|3J|H)' "$work/output" && bad 'result was cleared'
     fi
+    reset_case
+    menu <<< 2 > "$work/output" 2>&1 || bad 'result pause EOF failed'
+    prompt_count 2
+    check grep -q '按回车返回主菜单' "$work/prompts"
+    check test "$(grep -c '请输入选项' "$work/prompts")" -eq 1
+    check grep -q 'result:view' "$work/output"
     reset_case
     menu < /dev/null > "$work/output" 2>&1 || bad 'menu EOF failed'
     prompt_count 1
@@ -78,9 +85,14 @@ setup_menu_stubs() {
     menu <<< Q > "$work/output" 2>&1 || bad 'Q did not exit'
     prompt_count 1
     reset_case
-    menu <<< $'invalid\n0' > "$work/output" 2>&1 || bad 'invalid menu input failed'
-    prompt_count 2
-    pass 'consecutive actions, visible results, invalid menu input and exit'
+    menu <<< $'invalid\n\n0' > "$work/output" 2>&1 || bad 'invalid menu input failed'
+    prompt_count 3
+    edit_rule() { read_input cancelled 'cancel test'; }
+    reset_case
+    menu <<< $'1\nq\n0' > "$work/output" 2>&1 || bad 'cancel failed'
+    prompt_count 3
+    grep -q '按回车返回' "$work/prompts" && bad 'cancel asked for another Enter'
+    pass 'results wait for Enter, menus do not redraw early, cancellation returns directly'
 ) || exit 1
 
 # Reload is intercepted here so no installed command or real service is touched.
@@ -113,8 +125,8 @@ fixture() {
 }
 fixture
 reset_case
-check edit_rule 0 <<< $'1\nnew-name\n2\nnew.example\n3\n20000\n4\n8443\n5\n3\n0' > "$work/output" 2>&1
-prompt_count 11
+check edit_rule 0 <<< $'1\nnew-name\n\n2\nnew.example\n\n3\n20000\n\n4\n8443\n\n5\n3\n\n0' > "$work/output" 2>&1
+prompt_count 16
 check test "$(wc -l < "$work/transactions")" -eq 5
 check jq -e '.endpoints[0] | .name=="new-name" and .listen=="[::]:20000" and .remote=="new.example:8443" and .network.use_udp==true and .network.no_tcp==false' "$CONF" >/dev/null
 pass 'field menu edits name, host, both ports and protocol directly'
