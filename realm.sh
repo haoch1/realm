@@ -1495,11 +1495,11 @@ menu() {
         menu_row "    ${BLUE}管理脚本版本：${GREEN}v${SCRIPT_VERSION}${BLUE}${NC}"
         printf '%s  ╠═══════════════════════════════════════╣%s\n' "$BLUE" "$NC"
         menu_row "  ${BLUE}基础功能${NC}"
-        menu_row "  ${GREEN}[1]${BLUE}  添加转发规则${NC}"
-        menu_row "  ${GREEN}[2]${BLUE}  查看转发规则${NC}"
-        menu_row "  ${GREEN}[3]${BLUE}  修改转发规则${NC}"
-        menu_row "  ${GREEN}[4]${BLUE}  删除转发规则${NC}"
-        menu_row "  ${GREEN}[5]${BLUE}  清空转发规则${NC}"
+        menu_row "  ${GREEN}[1]${BLUE}  添加转发${NC}"
+        menu_row "  ${GREEN}[2]${BLUE}  查看转发${NC}"
+        menu_row "  ${GREEN}[3]${BLUE}  修改转发${NC}"
+        menu_row "  ${GREEN}[4]${BLUE}  删除转发${NC}"
+        menu_row "  ${GREEN}[5]${BLUE}  清空转发${NC}"
         printf '%s  ║%39s║%s\n' "$BLUE" '' "$NC"
         menu_row "  ${BLUE}服务管理${NC}"
         menu_row "  ${GREEN}[6]${BLUE}  启动 Realm${NC}"
@@ -1513,7 +1513,7 @@ menu() {
         printf '%s  ║%39s║%s\n' "$BLUE" '' "$NC"
         menu_row "  ${GREEN}[0]${BLUE}  退出脚本${NC}"
         printf '%s  ╚═══════════════════════════════════════╝%s\n\n' "$BLUE" "$NC"
-        read_input choice '  请输入选项 [0-11] (q 退出): ' || {
+        read_input choice '  请输入选项 [0-11]: ' || {
             ((INPUT_EOF || MENU_CANCELLED)) && return 0
             interrupt_exit
         }
