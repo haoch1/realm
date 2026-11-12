@@ -32,7 +32,7 @@ fi
 
 # === 运行时路径与版本 ===
 DIR=/root/realm
-SCRIPT_VERSION=1.0.11
+SCRIPT_VERSION=1.0.12
 MANAGED_BIN=$DIR/realm
 BIN=$MANAGED_BIN
 SYSTEM_REALM=''
@@ -51,7 +51,7 @@ TEMP_RETENTION_MINUTES=1440
 LOCK=/run/lock/realm-manager.lock
 API=https://api.github.com/repos/zhboner/realm/releases/latest
 SCRIPT_URL=https://raw.githubusercontent.com/haoch1/realm/main/realm.sh
-BLUE=$'\033[1;36m' GREEN=$'\033[0;32m' RED=$'\033[0;31m' YELLOW=$'\033[0;33m' NC=$'\033[0m'
+BLUE=$'\033[1;36m' GREEN=$'\033[0;32m' RED=$'\033[0;31m' YELLOW=$'\033[0;33m' CYAN=$'\033[0;36m' NC=$'\033[0m'
 # Endpoint 的非空设置覆盖全局值；显式 false 也必须保留
 JQ_PROTOCOL='def protocol($global):
     ($global + ((.network // {}) | with_entries(select(.value != null)))) as $n
@@ -64,7 +64,7 @@ fail() {
     return 1
 }
 info() {
-    printf '  %s[信息] %s%s\n' "$BLUE" "$*" "$NC"
+    printf '  %s[信息] %s%s\n' "$CYAN" "$*" "$NC"
 }
 warn() {
     printf '  %s[注意] %s%s\n' "$YELLOW" "$*" "$NC"
@@ -75,12 +75,6 @@ success() {
 interrupt_exit() {
     printf '\n'
     exit 130
-}
-
-clear_terminal() {
-    [[ -t 1 ]] || return 0
-    command -v clear > /dev/null 2>&1 && clear 2> /dev/null || true
-    printf '\033[3J\033[2J\033[H\033[0m'
 }
 
 # === 日志轮转与临时文件维护 ===
@@ -149,12 +143,16 @@ read_input() {
     fi
     printf -v "$destination" '%s' "$reply"
 }
-pause_enter() {
-    local prompt=${1:-'  按回车返回主菜单...'} status=0
-    read -r -p "$prompt" _ || status=$?
-    ((status == 130)) && interrupt_exit
-    ((status != 0)) && INPUT_EOF=1
-    return 0
+confirm_action() {
+    local prompt=$1 answer
+    while true; do
+        read_input answer "  $prompt [y/N]: " || return 1
+        case "$answer" in
+            y | Y) return 0 ;;
+            n | N | '') MENU_CANCELLED=1; return 1 ;;
+            *) fail '请输入 y 或 n（回车取消）' ;;
+        esac
+    done
 }
 get() (
     # 网络子进程不应继承管理锁，避免短暂下载进程延长锁的生命周期
@@ -1014,7 +1012,7 @@ view_rules() {
 }
 
 choose_rule() {
-    local result=$1 action=${2:-选择} n count
+    local result=$1 action=${2:-选择} n count prompt
     count=$(jq '.endpoints|length' "$CONF") || return 1
     printf '\n' >&2
     info "=== ${action}端口转发规则 ===" >&2
@@ -1025,16 +1023,27 @@ choose_rule() {
     }
     print_rules >&2
     printf '\n' >&2
-    read_input n "  请输入要${action}的序号 (0 取消): " || return 1
-    [[ -n $n && $n != 0 ]] || {
+    prompt="  请输入要${action}的序号 (0 返回): "
+    [[ $action != 删除 ]] || prompt='  请输入要删除的序号 (选中即删除，0 返回): '
+    read_input n "$prompt" || return 1
+    [[ -n $n ]] || {
         MENU_CANCELLED=1
         return 1
     }
-    [[ $n =~ ^[0-9]{1,6}$ ]] && ((10#$n > 0 && 10#$n <= count)) || {
+    [[ $n =~ ^[0-9]{1,6}$ ]] || {
         fail '无效选择'
         return 1
     }
-    printf -v "$result" '%d' "$((10#$n - 1))"
+    n=$((10#$n))
+    ((n != 0)) || {
+        MENU_CANCELLED=1
+        return 1
+    }
+    ((n <= count)) || {
+        fail '无效选择'
+        return 1
+    }
+    printf -v "$result" '%d' "$((n - 1))"
 }
 
 save_rule() {
@@ -1133,10 +1142,10 @@ read_port() {
 
 choose_protocol() {
     local result=$1 current=${2:-} choice selected prompt='  请选择 [1-3] (默认 1): '
-    printf '\n  %s请选择转发协议：%s\n' "$BLUE" "$NC" >&2
-    printf '    %s[1]%s 仅 TCP\n    %s[2]%s 仅 UDP\n    %s[3]%s TCP+UDP\n' "$GREEN" "$NC" "$GREEN" "$NC" "$GREEN" "$NC" >&2
+    printf '\n  请选择协议:\n\n' >&2
+    printf '  %s[1]%s 仅 TCP\n  %s[2]%s 仅 UDP\n  %s[3]%s TCP+UDP\n' "$GREEN" "$NC" "$GREEN" "$NC" "$GREEN" "$NC" >&2
     if [[ -n $current ]]; then
-        printf '    %s[0]%s 保持 %s\n' "$GREEN" "$NC" "${current^^}" >&2
+        printf '  %s[0]%s 保持 %s\n' "$GREEN" "$NC" "${current^^}" >&2
         prompt='  请选择 [0-3] (回车不改): '
     fi
     while true; do
@@ -1158,48 +1167,89 @@ choose_protocol() {
 }
 
 edit_rule() {
-    local index=${1:--1} port='' host='' target='' protocol='' name='' value h
-    local host_prompt='  请输入目标地址 (IP 或域名): ' target_label='请输入目标端口'
+    local index=${1:--1} port host target protocol name h
     if ((index >= 0)); then
-        value=$(jq -r --argjson i "$index" '.endpoints[$i].listen' "$CONF") || return 1
-        port=${value##*:}
-        value=$(jq -r --argjson i "$index" '.endpoints[$i].remote' "$CONF") || return 1
-        target=${value##*:}
-        host=${value%:*}
-        protocol=$(jq -r --argjson i "$index" "$JQ_PROTOCOL"' .network as $g | .endpoints[$i] | protocol($g)' "$CONF") || return 1
-        name=$(jq -r --argjson i "$index" --arg fallback "转发规则-$port" '.endpoints[$i].name // $fallback' "$CONF") || return 1
-        printf '\n  当前规则: 【%s】 本机 :%s%s%s → %s%s%s  [%s%s%s]\n\n' \
-            "$name" "$BLUE" "$port" "$NC" "$BLUE" "$value" "$NC" "$YELLOW" "${protocol^^}" "$NC"
-        read_input value "  新备注名称 (回车保持 $name): " || return 1
-        name=${value:-$name}
-        read_port port '新本机监听端口' "$port" || return 1
-        host_prompt="  新目标地址 (回车保持 $host): "
-        target_label='新目标端口'
-    else
-        printf '\n'
-        info '=== 添加端口转发规则 ==='
-        printf '\n'
-        read_port port '请输入本机监听端口' || return 1
+        modify_rule "$index"
+        return
     fi
+    printf '\n'
+    info '=== 添加端口转发规则 ==='
+    printf '\n'
+    read_port port '请输入本机监听端口' || return 1
     while true; do
-        read_input h "$host_prompt" || return 1
-        h=${h:-$host}
+        read_input h '  请输入目标地址 (IP 或域名): ' || return 1
         if remote_address "$h" 1 > /dev/null; then
             host=$h
             break
         fi
     done
     show_resolution "$host" || return 1
-    read_port target "$target_label" "$target" || return 1
-    choose_protocol protocol "$protocol" || return 1
-    if ((index < 0)); then
-        read_input name "  请输入备注名称 (回车默认: 转发规则-$port): " || return 1
-    fi
+    read_port target '请输入目标端口' || return 1
+    choose_protocol protocol || return 1
+    read_input name "  备注名称 (默认 转发规则-$port): " || return 1
     save_rule "$index" "$port" "$host" "$target" "$protocol" "$name"
 }
 
+modify_rule() {
+    local index=$1 port host target protocol name remote choice value previous
+    while true; do
+        value=$(jq -r --argjson i "$index" '.endpoints[$i].listen' "$CONF") || return 1
+        port=${value##*:}
+        remote=$(jq -r --argjson i "$index" '.endpoints[$i].remote' "$CONF") || return 1
+        host=${remote%:*}
+        target=${remote##*:}
+        protocol=$(jq -r --argjson i "$index" "$JQ_PROTOCOL"' .network as $g | .endpoints[$i] | protocol($g)' "$CONF") || return 1
+        name=$(jq -r --argjson i "$index" --arg fallback "转发规则-$port" '.endpoints[$i].name // $fallback' "$CONF") || return 1
+        printf '\n  当前规则: %s%s%s (%s) @ %s%s%s → %s%s%s\n\n' \
+            "$GREEN" "$name" "$NC" "${protocol^^}" "$BLUE" "$port" "$NC" "$BLUE" "$remote" "$NC"
+        printf '  %s[1]%s 修改备注名称\n  %s[2]%s 修改目标地址\n  %s[3]%s 修改监听端口\n  %s[4]%s 修改目标端口\n  %s[5]%s 修改转发协议\n  %s[0]%s 返回\n' \
+            "$GREEN" "$NC" "$GREEN" "$NC" "$GREEN" "$NC" "$GREEN" "$NC" "$GREEN" "$NC" "$GREEN" "$NC"
+        read_input choice '  请选择修改项: ' || return 1
+        case "$choice" in
+            0 | '') return 0 ;;
+            1)
+                read_input value "  请输入新备注名称 (回车保持 $name): " || return 1
+                value=${value:-$name}
+                [[ ${#value} -le 60 && ! $value =~ [[:cntrl:]] ]] || {
+                    fail '备注限 60 字，不能包含控制字符'
+                    continue
+                }
+                previous=$name
+                name=$value
+                ;;
+            2)
+                read_input value "  请输入新的目标地址 (回车保持 $host): " || return 1
+                value=${value:-$host}
+                remote_address "$value" "$target" > /dev/null || continue
+                [[ $value != "$host" ]] || continue
+                show_resolution "$value" || return 1
+                previous=$host
+                host=$value
+                ;;
+            3)
+                read_port value '请输入新的监听端口' "$port" || return 1
+                previous=$port
+                port=$value
+                ;;
+            4)
+                read_port value '请输入新的目标端口' "$target" || return 1
+                previous=$target
+                target=$value
+                ;;
+            5)
+                choose_protocol value "$protocol" || return 1
+                previous=$protocol
+                protocol=$value
+                ;;
+            *) fail '无效选择'; continue ;;
+        esac
+        [[ $value != "$previous" ]] || continue
+        save_rule "$index" "$port" "$host" "$target" "$protocol" "$name" || return 1
+    done
+}
+
 delete_rules() {
-    local index=$1 temp answer count selected_port status
+    local index=$1 temp count selected_port status
     if ((index == -1)); then
         count=$(jq '.endpoints|length' "$CONF") || return 1
         if ((count == 0)); then
@@ -1207,12 +1257,7 @@ delete_rules() {
             return 0
         fi
         printf '\n'
-        warn "确认清空全部 ${count} 条端口转发规则？"
-        read_input answer '  (Y/N): ' || return 1
-        [[ $answer == y || $answer == Y ]] || {
-            MENU_CANCELLED=1
-            return 1
-        }
+        confirm_action "确认清空全部 $count 条端口转发规则？" || return 1
     else
         selected_port=$(jq -r --argjson i "$index" '.endpoints[$i].listen | split(":") | last' "$CONF") || return 1
     fi
@@ -1295,16 +1340,12 @@ remove_uninstall_paths() {
 }
 
 uninstall() {
-    local answer leftover startup="$RUNLEVEL/realm"
+    local leftover startup="$RUNLEVEL/realm"
     [[ $INIT == systemd ]] && startup="${SYSTEMD_UNIT%/*}/multi-user.target.wants/realm.service"
     printf '\n'
     info '=== 一键卸载 Realm ==='
     printf '\n'
-    read_input answer "  ${YELLOW}[注意] 卸载将删除 Realm、全部规则和备份，是否继续？(Y/N): ${NC}" || return 1
-    [[ $answer == y || $answer == Y ]] || {
-        MENU_CANCELLED=1
-        return 1
-    }
+    confirm_action '确认卸载 Realm、全部规则、备份和管理脚本？' || return 1
     check_service || return 1
     check_uninstall_unit "$UNIT" && check_uninstall_startup "$startup" "$UNIT" || return 1
     if [[ -f $UNIT ]] || svc active; then
@@ -1353,7 +1394,7 @@ uninstall() {
     printf '  卸载完成：服务、核心、规则、备份、独立日志和 r 命令已清理\n'
 }
 
-# === 菜单与命令行入口 ===
+# === 菜单绘制与命令行入口 ===
 run_menu_action() {
     "$@"
     local status=$?
@@ -1361,56 +1402,94 @@ run_menu_action() {
     return "$status"
 }
 
+display_width() {
+    printf '%s' "$1" | LC_ALL=C awk '
+        BEGIN {
+            for (i = 0; i < 256; i++) ord[sprintf("%c", i)] = i
+            escape = sprintf("%c", 27)
+        }
+        {
+            gsub(escape "\\[[0-9;]*m", "")
+            width = 0
+            bytes = length($0)
+            for (i = 1; i <= bytes; i++) {
+                code = ord[substr($0, i, 1)]
+                if (code < 128) { width += 1; continue }
+                if (code >= 192 && code < 224) { i += 1; width += 1; continue }
+                if (code >= 224 && code < 240) {
+                    unicode = (code - 224) * 4096 \
+                        + (ord[substr($0, i + 1, 1)] - 128) * 64 \
+                        + (ord[substr($0, i + 2, 1)] - 128)
+                    if ((unicode >= 4352 && unicode <= 4447) ||
+                        (unicode >= 11904 && unicode <= 12351) ||
+                        (unicode >= 12352 && unicode <= 13311) ||
+                        (unicode >= 13312 && unicode <= 19903) ||
+                        (unicode >= 19968 && unicode <= 40959) ||
+                        (unicode >= 40960 && unicode <= 42191) ||
+                        (unicode >= 44032 && unicode <= 55203) ||
+                        (unicode >= 63744 && unicode <= 64255) ||
+                        (unicode >= 65040 && unicode <= 65103) ||
+                        (unicode >= 65280 && unicode <= 65376) ||
+                        (unicode >= 65504 && unicode <= 65510)) width += 2
+                    else width += 1
+                    i += 2
+                    continue
+                }
+                if (code >= 240) { i += 3; width += 2; continue }
+                width += 1
+            }
+            printf "%d", width
+        }'
+}
+
+menu_row() {
+    local text="$1" width pad
+    width=$(display_width "$text")
+    [[ "$width" =~ ^[0-9]+$ ]] || width=0
+    pad=$((39 - width))
+    ((pad > 0)) || pad=0
+    printf '  %s║%s%*s%s║%s\n' "$BLUE" "$text" "$pad" '' "$BLUE" "$NC"
+}
+
 menu() {
-    local count choice index header_pad state state_pad core core_width core_pad script_pad
+    # 自动返回时保留操作结果，不清屏或额外等待回车
+    local count choice index state core
     MENU_CANCELLED=0 INPUT_EOF=0
     while true; do
         MENU_CANCELLED=0 INPUT_EOF=0
-        clear_terminal
         count=$(jq '.endpoints|length' "$CONF") || return 1
         service_state state
         core_version core
-        header_pad=$((6 - ${#count}))
-        ((header_pad > 0)) || header_pad=1
-        state_pad=17
-        case $core in
-            未安装) core_width=6 ;;
-            未知) core_width=4 ;;
-            *) core_width=${#core} ;;
-        esac
-        core_pad=$((23 - core_width))
-        ((core_pad > 0)) || core_pad=1
-        script_pad=$((24 - ${#SCRIPT_VERSION}))
-        ((script_pad > 0)) || script_pad=1
         printf '\n%s  ╔═══════════════════════════════════════╗\n' "$BLUE"
-        printf '  ║    端口转发管理（当前规则：%s%s%s 条）%*s║\n' "$GREEN" "$count" "$BLUE" "$header_pad" ''
-        printf '  ║    Realm 状态：%s%s%s%*s║\n' "$GREEN" "$state" "$BLUE" "$state_pad" ''
-        printf '  ║    Realm 版本：%s%s%s%*s║\n' "$GREEN" "$core" "$BLUE" "$core_pad" ''
-        printf '  ║    管理脚本：%sv%s%s%*s║\n' "$GREEN" "$SCRIPT_VERSION" "$BLUE" "$script_pad" ''
-        printf '  ╠═══════════════════════════════════════╣\n'
-        printf '  ║  %s基础功能%29s║\n' "$BLUE" ''
-        printf '  ║  %s[1]%s  添加转发规则%20s║\n' "$GREEN" "$BLUE" ''
-        printf '  ║  %s[2]%s  查看转发规则%20s║\n' "$GREEN" "$BLUE" ''
-        printf '  ║  %s[3]%s  修改转发规则%20s║\n' "$GREEN" "$BLUE" ''
-        printf '  ║  %s[4]%s  删除转发规则%20s║\n' "$GREEN" "$BLUE" ''
-        printf '  ║  %s[5]%s  清空所有转发规则%16s║\n' "$GREEN" "$BLUE" ''
-        printf '  ║%39s║\n' ''
-        printf '  ║  %s服务管理%29s║\n' "$BLUE" ''
-        printf '  ║  %s[6]%s  启动 Realm%22s║\n' "$GREEN" "$BLUE" ''
-        printf '  ║  %s[7]%s  停止 Realm%22s║\n' "$GREEN" "$BLUE" ''
-        printf '  ║  %s[8]%s  重启 Realm%22s║\n' "$GREEN" "$BLUE" ''
-        printf '  ║%39s║\n' ''
-        printf '  ║  %s更新与卸载%27s║\n' "$BLUE" ''
-        printf '  ║  %s[9]%s  安装/更新 Realm%17s║\n' "$GREEN" "$BLUE" ''
-        printf '  ║  %s[10]%s 更新管理脚本%20s║\n' "$GREEN" "$BLUE" ''
-        printf '  ║  %s[11]%s 一键卸载%24s║\n' "$GREEN" "$BLUE" ''
-        printf '  ║%39s║\n' ''
-        printf '  ║  %s[0]%s  退出脚本%24s║\n' "$GREEN" "$BLUE" ''
-        printf '  ╚═══════════════════════════════════════╝%s\n\n' "$NC"
-        read -r -p '  请输入选项 [0-11]: ' choice
-        local status=$?
-        ((status == 130)) && interrupt_exit
-        ((status == 0)) || return 0
+        menu_row "    ${BLUE}端口转发管理（当前规则：${GREEN}${count}${BLUE} 条）${NC}"
+        menu_row "    ${BLUE}Realm 状态：${GREEN}${state}${BLUE}${NC}"
+        menu_row "    ${BLUE}Realm 版本：${GREEN}${core}${BLUE}${NC}"
+        menu_row "    ${BLUE}管理脚本版本：${GREEN}v${SCRIPT_VERSION}${BLUE}${NC}"
+        printf '%s  ╠═══════════════════════════════════════╣%s\n' "$BLUE" "$NC"
+        menu_row "  ${BLUE}基础功能${NC}"
+        menu_row "  ${GREEN}[1]${BLUE}  添加转发规则${NC}"
+        menu_row "  ${GREEN}[2]${BLUE}  查看转发规则${NC}"
+        menu_row "  ${GREEN}[3]${BLUE}  修改转发规则${NC}"
+        menu_row "  ${GREEN}[4]${BLUE}  删除转发规则${NC}"
+        menu_row "  ${GREEN}[5]${BLUE}  清空转发规则${NC}"
+        printf '%s  ║%39s║%s\n' "$BLUE" '' "$NC"
+        menu_row "  ${BLUE}服务管理${NC}"
+        menu_row "  ${GREEN}[6]${BLUE}  启动 Realm${NC}"
+        menu_row "  ${GREEN}[7]${BLUE}  停止 Realm${NC}"
+        menu_row "  ${GREEN}[8]${BLUE}  重启 Realm${NC}"
+        printf '%s  ║%39s║%s\n' "$BLUE" '' "$NC"
+        menu_row "  ${BLUE}更新与维护${NC}"
+        menu_row "  ${GREEN}[9]${BLUE}  安装/更新核心${NC}"
+        menu_row "  ${GREEN}[10]${BLUE} 更新管理脚本${NC}"
+        menu_row "  ${GREEN}[11]${BLUE} 一键卸载${NC}"
+        printf '%s  ║%39s║%s\n' "$BLUE" '' "$NC"
+        menu_row "  ${GREEN}[0]${BLUE}  退出脚本${NC}"
+        printf '%s  ╚═══════════════════════════════════════╝%s\n\n' "$BLUE" "$NC"
+        printf '  提示：修改直接生效；q 取消/退出；清空和卸载需确认。\n\n'
+        read_input choice '  请输入选项 [0-11] (q 退出): ' || {
+            ((INPUT_EOF || MENU_CANCELLED)) && return 0
+            interrupt_exit
+        }
         case "$choice" in
             1) run_menu_action edit_rule || true ;;
             2) run_menu_action view_rules || true ;;
@@ -1419,20 +1498,17 @@ menu() {
             5) run_menu_action delete_rules -1 || true ;;
             6)
                 printf '\n'
-                info '=== 启动 Realm ==='
-                printf '\n'
+                info '启动 Realm'
                 run_menu_action start_realm || true
                 ;;
             7)
                 printf '\n'
-                info '=== 停止 Realm ==='
-                printf '\n'
+                info '停止 Realm'
                 run_menu_action stop_realm || true
                 ;;
             8)
                 printf '\n'
-                info '=== 重启 Realm ==='
-                printf '\n'
+                info '重启 Realm'
                 run_menu_action restart_realm || true
                 ;;
             9)
@@ -1441,8 +1517,6 @@ menu() {
                 ;;
             10)
                 if run_menu_action update_management_script; then
-                    pause_enter '  按回车加载最新脚本...'
-                    ((INPUT_EOF)) && return 0
                     reload_script
                     return
                 fi
@@ -1455,7 +1529,6 @@ menu() {
             0) return 0 ;;
             *) fail '无效选项' ;;
         esac
-        ((MENU_CANCELLED)) || pause_enter
         ((INPUT_EOF)) && return 0
     done
 }
