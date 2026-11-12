@@ -32,7 +32,7 @@ fi
 
 # === 运行时路径与版本 ===
 DIR=/root/realm
-SCRIPT_VERSION=1.0.12
+SCRIPT_VERSION=1.0.13
 MANAGED_BIN=$DIR/realm
 BIN=$MANAGED_BIN
 SYSTEM_REALM=''
@@ -75,6 +75,11 @@ success() {
 interrupt_exit() {
     printf '\n'
     exit 130
+}
+
+clear_terminal() {
+    [[ -t 1 ]] || return 0
+    printf '\033[2J\033[H\033[0m'
 }
 
 # === 日志轮转与临时文件维护 ===
@@ -154,6 +159,14 @@ confirm_action() {
         esac
     done
 }
+
+wait_for_reload() {
+    local status=0
+    read -r -p '  按回车加载最新脚本...' _ || status=$?
+    ((status == 130)) && interrupt_exit
+    ((status == 0))
+}
+
 get() (
     # 网络子进程不应继承管理锁，避免短暂下载进程延长锁的生命周期
     exec 9>&-
@@ -1452,8 +1465,9 @@ menu_row() {
 }
 
 menu() {
-    # 自动返回时保留操作结果，不清屏或额外等待回车
+    # 首次进入或加载新版时清屏，后续自动返回时保留操作结果
     local count choice index state core
+    clear_terminal
     MENU_CANCELLED=0 INPUT_EOF=0
     while true; do
         MENU_CANCELLED=0 INPUT_EOF=0
@@ -1517,6 +1531,7 @@ menu() {
                 ;;
             10)
                 if run_menu_action update_management_script; then
+                    wait_for_reload || return 0
                     reload_script
                     return
                 fi

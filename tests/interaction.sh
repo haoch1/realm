@@ -88,10 +88,16 @@ setup_menu_stubs() {
     setup_menu_stubs
     reload_script() { touch "$work/reloaded"; }
     reset_case
-    menu <<< 10 > "$work/output" 2>&1 || bad 'script update failed'
-    prompt_count 1
+    menu <<< $'10\n' > "$work/output" 2>&1 || bad 'script update failed'
+    prompt_count 2
     check test -f "$work/reloaded"
-    pass 'script updates reload without another read'
+    check grep -q '按回车加载最新脚本' "$work/prompts"
+    rm -f -- "$work/reloaded"
+    reset_case
+    menu <<< 10 > "$work/output" 2>&1 || bad 'reload EOF failed'
+    prompt_count 2
+    check test ! -f "$work/reloaded"
+    pass 'script updates wait for Enter and skip reload on EOF'
 ) || exit 1
 
 DIR=$work
