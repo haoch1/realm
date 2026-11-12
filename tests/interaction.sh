@@ -123,6 +123,8 @@ fixture() {
     : > "$work/transactions"
     printf '%s\n' '{"network":{"no_tcp":false,"use_udp":false},"endpoints":[{"listen":"[::]:1080","remote":"example.com:443","name":"original","network":{"no_tcp":false,"use_udp":false}}]}' > "$CONF"
 }
+# Editors must retain the main menu displayed before selecting a rule.
+clear_terminal() { bad 'editor cleared the main menu'; }
 fixture
 reset_case
 check edit_rule 0 <<< $'1\nnew-name\n\n2\nnew.example\n\n3\n20000\n\n4\n8443\n\n5\n3\n\n0' > "$work/output" 2>&1

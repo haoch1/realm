@@ -1210,7 +1210,6 @@ edit_rule() {
 modify_rule() {
     local index=$1 port host target protocol name remote choice value previous
     while true; do
-        clear_terminal
         value=$(jq -r --argjson i "$index" '.endpoints[$i].listen' "$CONF") || return 1
         port=${value##*:}
         remote=$(jq -r --argjson i "$index" '.endpoints[$i].remote' "$CONF") || return 1
