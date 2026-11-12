@@ -1225,7 +1225,14 @@ edit_rule() {
 
 modify_rule() {
     local index=$1 port host target protocol name remote choice value previous
+    local redraw_menu=0
     while true; do
+        # 首次显示保留主菜单，返回编辑时清理旧画面并恢复主菜单
+        if ((redraw_menu)); then
+            clear_terminal
+            draw_main_menu || return 1
+        fi
+        redraw_menu=1
         value=$(jq -r --argjson i "$index" '.endpoints[$i].listen' "$CONF") || return 1
         port=${value##*:}
         remote=$(jq -r --argjson i "$index" '.endpoints[$i].remote' "$CONF") || return 1
@@ -1493,41 +1500,46 @@ menu_row() {
     printf '  %s║%s%*s%s║%s\n' "$BLUE" "$text" "$pad" '' "$BLUE" "$NC"
 }
 
+draw_main_menu() {
+    local count state core
+    count=$(jq '.endpoints|length' "$CONF") || return 1
+    service_state state
+    core_version core
+    printf '\n%s  ╔═══════════════════════════════════════╗\n' "$BLUE"
+    menu_row "    ${BLUE}端口转发管理（当前规则：${GREEN}${count}${BLUE} 条）${NC}"
+    menu_row "    ${BLUE}Realm 状态：${GREEN}${state}${BLUE}${NC}"
+    menu_row "    ${BLUE}Realm 版本：${GREEN}${core}${BLUE}${NC}"
+    menu_row "    ${BLUE}管理脚本版本：${GREEN}v${SCRIPT_VERSION}${BLUE}${NC}"
+    printf '%s  ╠═══════════════════════════════════════╣%s\n' "$BLUE" "$NC"
+    menu_row "  ${BLUE}基础功能${NC}"
+    menu_row "  ${GREEN}[1]${BLUE}  添加转发${NC}"
+    menu_row "  ${GREEN}[2]${BLUE}  查看转发${NC}"
+    menu_row "  ${GREEN}[3]${BLUE}  修改转发${NC}"
+    menu_row "  ${GREEN}[4]${BLUE}  删除转发${NC}"
+    menu_row "  ${GREEN}[5]${BLUE}  清空转发${NC}"
+    printf '%s  ║%39s║%s\n' "$BLUE" '' "$NC"
+    menu_row "  ${BLUE}服务管理${NC}"
+    menu_row "  ${GREEN}[6]${BLUE}  启动 Realm${NC}"
+    menu_row "  ${GREEN}[7]${BLUE}  停止 Realm${NC}"
+    menu_row "  ${GREEN}[8]${BLUE}  重启 Realm${NC}"
+    printf '%s  ║%39s║%s\n' "$BLUE" '' "$NC"
+    menu_row "  ${BLUE}更新与维护${NC}"
+    menu_row "  ${GREEN}[9]${BLUE}  安装/更新核心${NC}"
+    menu_row "  ${GREEN}[10]${BLUE} 更新管理脚本${NC}"
+    menu_row "  ${GREEN}[11]${BLUE} 一键卸载${NC}"
+    printf '%s  ║%39s║%s\n' "$BLUE" '' "$NC"
+    menu_row "  ${GREEN}[0]${BLUE}  退出脚本${NC}"
+    printf '%s  ╚═══════════════════════════════════════╝%s\n\n' "$BLUE" "$NC"
+}
+
 menu() {
     # 操作结果停留到回车，返回菜单时再清屏
-    local count choice index state core
+    local choice index
     MENU_CANCELLED=0 INPUT_EOF=0
     while true; do
         MENU_CANCELLED=0 INPUT_EOF=0
         clear_terminal
-        count=$(jq '.endpoints|length' "$CONF") || return 1
-        service_state state
-        core_version core
-        printf '\n%s  ╔═══════════════════════════════════════╗\n' "$BLUE"
-        menu_row "    ${BLUE}端口转发管理（当前规则：${GREEN}${count}${BLUE} 条）${NC}"
-        menu_row "    ${BLUE}Realm 状态：${GREEN}${state}${BLUE}${NC}"
-        menu_row "    ${BLUE}Realm 版本：${GREEN}${core}${BLUE}${NC}"
-        menu_row "    ${BLUE}管理脚本版本：${GREEN}v${SCRIPT_VERSION}${BLUE}${NC}"
-        printf '%s  ╠═══════════════════════════════════════╣%s\n' "$BLUE" "$NC"
-        menu_row "  ${BLUE}基础功能${NC}"
-        menu_row "  ${GREEN}[1]${BLUE}  添加转发${NC}"
-        menu_row "  ${GREEN}[2]${BLUE}  查看转发${NC}"
-        menu_row "  ${GREEN}[3]${BLUE}  修改转发${NC}"
-        menu_row "  ${GREEN}[4]${BLUE}  删除转发${NC}"
-        menu_row "  ${GREEN}[5]${BLUE}  清空转发${NC}"
-        printf '%s  ║%39s║%s\n' "$BLUE" '' "$NC"
-        menu_row "  ${BLUE}服务管理${NC}"
-        menu_row "  ${GREEN}[6]${BLUE}  启动 Realm${NC}"
-        menu_row "  ${GREEN}[7]${BLUE}  停止 Realm${NC}"
-        menu_row "  ${GREEN}[8]${BLUE}  重启 Realm${NC}"
-        printf '%s  ║%39s║%s\n' "$BLUE" '' "$NC"
-        menu_row "  ${BLUE}更新与维护${NC}"
-        menu_row "  ${GREEN}[9]${BLUE}  安装/更新核心${NC}"
-        menu_row "  ${GREEN}[10]${BLUE} 更新管理脚本${NC}"
-        menu_row "  ${GREEN}[11]${BLUE} 一键卸载${NC}"
-        printf '%s  ║%39s║%s\n' "$BLUE" '' "$NC"
-        menu_row "  ${GREEN}[0]${BLUE}  退出脚本${NC}"
-        printf '%s  ╚═══════════════════════════════════════╝%s\n\n' "$BLUE" "$NC"
+        draw_main_menu || return 1
         read_input choice '  请输入选项 [0-11]: ' || {
             ((INPUT_EOF || MENU_CANCELLED)) && return 0
             interrupt_exit
