@@ -51,7 +51,12 @@ TEMP_RETENTION_MINUTES=1440
 LOCK=/run/lock/realm-manager.lock
 API=https://api.github.com/repos/zhboner/realm/releases/latest
 SCRIPT_URL=https://raw.githubusercontent.com/haoch1/realm/main/realm.sh
-BLUE=$'\033[1;36m' GREEN=$'\033[0;32m' RED=$'\033[0;31m' YELLOW=$'\033[0;33m' CYAN=$'\033[0;36m' NC=$'\033[0m'
+BLUE=$'\033[1;36m'
+GREEN=$'\033[0;32m'
+RED=$'\033[0;31m'
+YELLOW=$'\033[0;33m'
+CYAN=$'\033[0;36m'
+NC=$'\033[0m'
 # Endpoint 的非空设置覆盖全局值；显式 false 也必须保留
 JQ_PROTOCOL='def protocol($global):
     ($global + ((.network // {}) | with_entries(select(.value != null)))) as $n
@@ -1063,9 +1068,35 @@ choose_rule() {
     printf -v "$result" '%d' "$((n - 1))"
 }
 
+valid_rule_name() {
+    [[ ${#1} -le 60 && ! $1 =~ [[:cntrl:]] ]]
+}
+
+# 排除当前 Realm 进程持有的原监听，其余占用均沿用原来的失败处理
+check_rule_sockets() {
+    local listen_port=$1 protocol=$2 previous_listen=$3 previous_protocol=$4 service_pid=$5
+    local transport socket_option socket_lines
+    for transport in tcp udp; do
+        [[ $protocol == "$transport" || $protocol == tcp+udp ]] || continue
+        socket_option=-ltnp
+        [[ $transport != udp ]] || socket_option=-uanp
+        socket_lines=$(ss -H "$socket_option" "sport = :$listen_port") || {
+            fail '无法检查端口占用'
+            return 1
+        }
+        [[ -n $socket_lines ]] || continue
+        if [[ ${previous_listen##*:} == "$listen_port" && ($previous_protocol == "$transport" || $previous_protocol == tcp+udp) && $service_pid =~ ^[1-9][0-9]*$ ]] &&
+            awk -v pid="pid=$service_pid," '!index($0,pid) {bad=1} END {exit bad}' <<< "$socket_lines"; then
+            continue
+        fi
+        fail "${transport^^} 端口 $listen_port 已被占用"
+        return 1
+    done
+}
+
 save_rule() {
     local index=$1 port=$2 host=$3 target=$4 protocol=${5:-tcp} name=${6:-}
-    local remote current='' old_protocol='' temp proto flag sockets pid=''
+    local remote current_listen='' previous_protocol='' candidate_file service_pid=''
     case "$protocol" in tcp | udp | tcp+udp) ;; *)
         fail '请选择 TCP、UDP 或 TCP+UDP'
         return 1
@@ -1077,7 +1108,7 @@ save_rule() {
     }
     port=$((10#$port))
     name=${name:-转发规则-$port}
-    [[ ${#name} -le 60 && ! $name =~ [[:cntrl:]] ]] || {
+    valid_rule_name "$name" || {
         fail '备注限 60 字，不能包含控制字符'
         return 1
     }
@@ -1092,34 +1123,19 @@ save_rule() {
         [[ $? == 1 ]] || return 1
     fi
     if ((index >= 0)); then
-        current=$(jq -r --argjson i "$index" '.endpoints[$i].listen' "$CONF") || return 1
-        old_protocol=$(jq -r --argjson i "$index" "$JQ_PROTOCOL"'
+        current_listen=$(jq -r --argjson i "$index" '.endpoints[$i].listen' "$CONF") || return 1
+        previous_protocol=$(jq -r --argjson i "$index" "$JQ_PROTOCOL"'
             .network as $g | .endpoints[$i] | protocol($g)' "$CONF") || return 1
         if svc active; then
-            pid=$(svc pid) || pid=''
+            service_pid=$(svc pid) || service_pid=''
         fi
     fi
-    for proto in tcp udp; do
-        [[ $protocol == "$proto" || $protocol == tcp+udp ]] || continue
-        flag=-ltnp
-        [[ $proto != udp ]] || flag=-uanp
-        sockets=$(ss -H "$flag" "sport = :$port") || {
-            fail '无法检查端口占用'
-            return 1
-        }
-        [[ -n $sockets ]] || continue
-        if [[ ${current##*:} == "$port" && ($old_protocol == "$proto" || $old_protocol == tcp+udp) && $pid =~ ^[1-9][0-9]*$ ]] &&
-            awk -v pid="pid=$pid," '!index($0,pid) {bad=1} END {exit bad}' <<< "$sockets"; then
-            continue
-        fi
-        fail "${proto^^} 端口 $port 已被占用"
-        return 1
-    done
-    temp=$(mktemp "$DIR/.rules.XXXXXX") || return 1
-    trap 'rm -f -- "$temp"; interrupt_exit' INT
+    check_rule_sockets "$port" "$protocol" "$current_listen" "$previous_protocol" "$service_pid" || return 1
+    candidate_file=$(mktemp "$DIR/.rules.XXXXXX") || return 1
+    trap 'rm -f -- "$candidate_file"; interrupt_exit' INT
     # 保留已有规则的监听地址；IPv4-only 系统不能绑定 [::]
-    local listen="${current%:*}:$port"
-    if [[ -z $current ]]; then
+    local listen="${current_listen%:*}:$port"
+    if [[ -z $current_listen ]]; then
         listen="[::]:$port"
         [[ -e /proc/net/if_inet6 ]] || listen="0.0.0.0:$port"
     fi
@@ -1127,11 +1143,11 @@ save_rule() {
         {listen:$l,remote:$r,name:$name} as $rule
         | {no_tcp:($proto=="udp"),use_udp:($proto!="tcp")} as $net
         | if $i<0 then .endpoints += [$rule + {network:$net}]
-          else .endpoints[$i] |= (. + $rule | .network = ((.network // {}) + $net)) end' "$CONF" > "$temp" && apply_rules "$temp"
-    local status=$?
+          else .endpoints[$i] |= (. + $rule | .network = ((.network // {}) + $net)) end' "$CONF" > "$candidate_file" && apply_rules "$candidate_file"
+    local apply_status=$?
     trap interrupt_exit INT
-    rm -f "$temp"
-    if ((status == 0)); then
+    rm -f "$candidate_file"
+    if ((apply_status == 0)); then
         if ((index < 0)); then
             success '端口转发规则已添加并生效'
         else
@@ -1141,7 +1157,7 @@ save_rule() {
         printf '  【%s】 本机端口: %s%s%s → 目标: %s%s%s\n' \
             "$name" "$GREEN" "$port" "$NC" "$GREEN" "$remote" "$NC"
     fi
-    return "$status"
+    return "$apply_status"
 }
 
 read_port() {
@@ -1227,7 +1243,7 @@ modify_rule() {
             1)
                 read_input value "  请输入新备注名称 (回车保持 $name): " || return 1
                 value=${value:-$name}
-                [[ ${#value} -le 60 && ! $value =~ [[:cntrl:]] ]] || {
+                valid_rule_name "$value" || {
                     fail '备注限 60 字，不能包含控制字符'
                     pause_enter '  按回车返回修改规则菜单...' || return 1
                     continue
